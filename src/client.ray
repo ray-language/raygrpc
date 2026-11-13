@@ -82,15 +82,36 @@ fn empty_map() -> Map<string, string> {
 }
 
 /// One unary call with the chosen client.
-pub fn unary(a: cli.Args, host: string, port: int, path: string, msg: bytes, md: Map<string, string>, timeout_ms: int) -> Result<Outcome, string> {
+pub fn unary(
+    a: cli.Args,
+    host: string,
+    port: int,
+    path: string,
+    msg: bytes,
+    md: Map<string, string>,
+    timeout_ms: int
+) -> Result<Outcome, string> {
     let engine = engine_of(a);
     let plain = cli.has(a, "plaintext");
     if (engine == "net") {
-        let c = if (plain) { grpc_conn.connect(host, port)? } else { grpc_conn.connect_tls(host, port)? };
+        let c = if (plain) {
+            grpc_conn.connect(host, port)?
+        } else {
+            grpc_conn.connect_tls(host, port)?
+        };
         let r = grpc_conn.call(c, path, msg, md, timeout_ms);
         grpc_conn.disconnect(c);
         let reply = r?;
-        return Result.Ok(Outcome { code: reply.status, message: reply.status_message, body: reply.message, headers: reply.metadata, trailers: empty_map(), merged: true });
+        return Result.Ok(
+            Outcome {
+                code: reply.status,
+                message: reply.status_message,
+                body: reply.message,
+                headers: reply.metadata,
+                trailers: empty_map(),
+                merged: true
+            }
+        );
     }
     if (engine == "oneshot") {
         // net/grpc_client: TLS + ALPN only, no metadata, no deadline, no grpc-message.
@@ -98,7 +119,16 @@ pub fn unary(a: cli.Args, host: string, port: int, path: string, msg: bytes, md:
             return Result.Err("-oneshot (net/grpc_client) only speaks TLS");
         }
         let r = grpc_client.grpc_call(host, port, path, msg)?;
-        return Result.Ok(Outcome { code: r.grpc_status, message: "", body: r.message, headers: empty_map(), trailers: empty_map(), merged: true });
+        return Result.Ok(
+            Outcome {
+                code: r.grpc_status,
+                message: "",
+                body: r.message,
+                headers: empty_map(),
+                trailers: empty_map(),
+                merged: true
+            }
+        );
     }
     if (engine != "raygrpc") {
         return Result.Err("-client must be net, raygrpc or oneshot");
@@ -107,14 +137,24 @@ pub fn unary(a: cli.Args, host: string, port: int, path: string, msg: bytes, md:
     let r = h2client.unary(s, path, msg, md, timeout_ms);
     h2client.hangup(s);
     let reply = r?;
-    Result.Ok(Outcome { code: reply.code, message: reply.status_message, body: reply.message, headers: reply.headers, trailers: reply.trailers, merged: false })
+    Result.Ok(
+        Outcome {
+            code: reply.code,
+            message: reply.status_message,
+            body: reply.message,
+            headers: reply.headers,
+            trailers: reply.trailers,
+            merged: false
+        }
+    )
 }
 
 /// Prints an error the way grpcurl does and returns its exit code.
 pub fn print_status_error(a: cli.Args, code: int, message: string) -> int {
     if (cli.has(a, "format-error")) {
+        // grpcurl writes it to stderr, like the plain form.
         let o = json.obj().field("code", code).field("message", message);
-        print(json.render_pretty(o, 2));
+        eprint(json.render_pretty(o, 2));
     } else {
         eprint("ERROR:\n  Code: ${code_title(code)}\n  Message: ${message}");
     }
@@ -133,7 +173,13 @@ fn print_metadata(title: string, m: Map<string, string>) {
 }
 
 /// The schema for a call or describe: files if given, else the server's reflection.
-pub fn schema_for(a: cli.Args, host: string, port: int, symbols: [string], md: Map<string, string>) -> Result<schema.Registry, string> {
+pub fn schema_for(
+    a: cli.Args,
+    host: string,
+    port: int,
+    symbols: [string],
+    md: Map<string, string>
+) -> Result<schema.Registry, string> {
     if (loader.has_files(a)) {
         return loader.from_files(a);
     }
@@ -212,7 +258,9 @@ pub fn call(a: cli.Args) -> Result<int, string> {
     };
     let (svc, m) = schema.method(reg, method_name)?;
     if (m.client_streaming || m.server_streaming) {
-        return Result.Err("${svc.full_name}.${m.name} is a streaming method; raygrpc calls unary methods only");
+        return Result.Err(
+            "${svc.full_name}.${m.name} is a streaming method; raygrpc calls unary methods only"
+        );
     }
     let text = request_text(a)?;
     let msg = match (codec.from_json(reg, m.input_type, text)) {
@@ -236,9 +284,18 @@ pub fn call(a: cli.Args) -> Result<int, string> {
     };
     let verbose = cli.has(a, "v");
     if (verbose) {
-        print("\nResolved method descriptor:\nrpc ${m.name} ( ${m.input_type} ) returns ( ${m.output_type} );");
+        print(
+            "\nResolved method descriptor:\nrpc ${m.name} ( ${m.input_type} ) returns ( ${m.output_type} );"
+        );
         print_metadata("Request metadata to send:", md);
-        print_metadata(if (out.merged) { "Response metadata (headers and trailers):" } else { "Response headers received:" }, out.headers);
+        print_metadata(
+            if (out.merged) {
+                "Response metadata (headers and trailers):"
+            } else {
+                "Response headers received:"
+            },
+            out.headers
+        );
     }
     if (out.code == 0) {
         let opts = codec.options();
@@ -255,7 +312,9 @@ pub fn call(a: cli.Args) -> Result<int, string> {
             print_metadata("Response trailers received:", out.trailers);
         }
         let n = if (out.code == 0) { 1 } else { 0 };
-        print("Sent 1 request and received ${n} response${if (n == 1) { "" } else { "s" }} in ${time.monotonic() - started} ms");
+        print(
+            "Sent 1 request and received ${n} response${if (n == 1) { "" } else { "s" }} in ${time.monotonic() - started} ms"
+        );
     }
     if (out.code != 0) {
         return Result.Ok(print_status_error(a, out.code, out.message));
@@ -268,7 +327,9 @@ pub fn list(a: cli.Args) -> Result<int, string> {
     let files = loader.has_files(a);
     let want_addr = if (files) { 0 } else { 1 };
     if (a.positional.len() < want_addr || a.positional.len() > want_addr + 1) {
-        return Result.Err("usage: raygrpc list [flags] HOST:PORT [SERVICE]   (or -proto/-protoset without HOST:PORT)");
+        return Result.Err(
+            "usage: raygrpc list [flags] HOST:PORT [SERVICE]   (or -proto/-protoset without HOST:PORT)"
+        );
     }
     let service_arg = if (a.positional.len() > want_addr) { a.positional[want_addr] } else { "" };
     if (files) {
@@ -295,7 +356,7 @@ pub fn list(a: cli.Args) -> Result<int, string> {
         },
     };
     match (fetched) {
-        Result.Ok(_) => {},
+        Result.Ok(_) => { },
         Result.Err(e) => {
             eprint("Failed to list methods for service \"${service_arg}\": ${e}");
             return Result.Ok(1);
@@ -304,7 +365,11 @@ pub fn list(a: cli.Args) -> Result<int, string> {
     print_list(reg, services, service_arg)
 }
 
-fn print_list(reg: schema.Registry, services: [string], service_arg: string) -> Result<int, string> {
+fn print_list(
+    reg: schema.Registry,
+    services: [string],
+    service_arg: string
+) -> Result<int, string> {
     if (service_arg == "") {
         for n in services {
             print(n);
@@ -314,12 +379,19 @@ fn print_list(reg: schema.Registry, services: [string], service_arg: string) -> 
     let svc = match (schema.service(reg, service_arg)) {
         Result.Ok(s) => s,
         Result.Err(_) => {
-            eprint("Failed to list methods for service \"${service_arg}\": Service not found: ${service_arg}");
+            eprint(
+                "Failed to list methods for service \"${service_arg}\": Service not found: ${service_arg}"
+            );
             return Result.Ok(1);
         },
     };
+    // Sorted, as grpcurl prints them.
+    var names: [string] = [];
     for m in svc.methods {
-        print("${svc.full_name}.${m.name}");
+        names.push("${svc.full_name}.${m.name}");
+    }
+    for n in sort(names) {
+        print(n);
     }
     Result.Ok(0)
 }
@@ -358,7 +430,7 @@ pub fn describe(a: cli.Args) -> Result<int, string> {
         loader.finish_reflection(r);
         h2client.hangup(s);
         match (result) {
-            Result.Ok(_) => {},
+            Result.Ok(_) => { },
             Result.Err(e) => {
                 eprint("Failed to resolve symbol: ${e}");
                 return Result.Ok(1);
@@ -398,7 +470,7 @@ fn field_line(reg: schema.Registry, f: schema.FieldDef, indent: string) -> strin
                     t = "map<${field_type(reg, k)}, ${field_type(reg, v)}>";
                 }
             },
-            Result.Err(_) => {},
+            Result.Err(_) => { },
         }
     }
     if (!t.starts_with("map<")) {
@@ -467,22 +539,22 @@ pub fn describe_symbol(reg: schema.Registry, sym: string) -> Option<string> {
             }
             return Option.Some(out + "}");
         },
-        Option.None => {},
+        Option.None => { },
     }
     match (reg.messages.get(sym)) {
         Option.Some(m) => return Option.Some("${sym} is a message:\n${message_text(reg, m, "")}"),
-        Option.None => {},
+        Option.None => { },
     }
     match (reg.enums.get(sym)) {
         Option.Some(e) => {
             let t = enum_text(e, "");
             return Option.Some("${sym} is an enum:\n${t.substring(0, t.len() - 1)}");
         },
-        Option.None => {},
+        Option.None => { },
     }
     match (schema.method(reg, sym)) {
         Result.Ok((_, m)) => return Option.Some("${sym} is a method:\n${method_line(m)}"),
-        Result.Err(_) => {},
+        Result.Err(_) => { },
     }
     Option.None
 }

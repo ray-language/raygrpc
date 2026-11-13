@@ -17,14 +17,31 @@ fn read_back(b: bytes) -> int {
 
 @test
 fn varints_round_trip_over_the_whole_int_range() {
-    let cases = [0, 1, 127, 128, 300, 16383, 16384, 2147483647, -1, -2, -2147483648, math.MAX_INT, math.MIN_INT];
+    let cases = [
+        0,
+        1,
+        127,
+        128,
+        300,
+        16383,
+        16384,
+        2147483647,
+        -1,
+        -2,
+        -2147483648,
+        math.MAX_INT,
+        math.MIN_INT
+    ];
     for v in cases {
         assert_eq_msg(read_back(varint_bytes(v)), v, "varint ${v}");
     }
     assert_eq(varint_bytes(300), bytes_of([0xAC, 0x02]));
     // A negative value is its 64-bit two's complement: always 10 octets.
     assert_eq(varint_bytes(-1).len(), 10);
-    assert_eq(varint_bytes(-1), bytes_of([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]));
+    assert_eq(
+        varint_bytes(-1),
+        bytes_of([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01])
+    );
 }
 
 @test
@@ -87,7 +104,10 @@ fn fixed_fields_are_little_endian() {
     wire.write_fixed32(w, 1, 0x0102_0304);
     wire.write_fixed64(w, 2, -2);
     let b = wire.finish(w);
-    assert_eq(b, bytes_of([0x0D, 4, 3, 2, 1, 0x11, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]));
+    assert_eq(
+        b,
+        bytes_of([0x0D, 4, 3, 2, 1, 0x11, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+    );
     let fields = wire.parse_raw(b).unwrap();
     match (fields[0].value) {
         wire.Raw.Fixed32(n) => assert_eq(n, 0x0102_0304),

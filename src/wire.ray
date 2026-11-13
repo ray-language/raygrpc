@@ -12,10 +12,15 @@ import std/math;
 
 /// Wire types (the low 3 bits of a tag).
 pub const VARINT: int = 0;
+
 pub const I64: int = 1;
+
 pub const LEN: int = 2;
+
 pub const SGROUP: int = 3;
+
 pub const EGROUP: int = 4;
+
 pub const I32: int = 5;
 
 /// The largest field number protobuf allows (2^29 - 1).

@@ -72,7 +72,9 @@ fn tokenize(src: string, file: string) -> Result<[Token], string> {
         } else if (is_digit(c) || ((c == '-' || c == '+') && i + 1 < n && is_digit(cs[i + 1]))) {
             let start = i;
             i = i + 1;
-            while (i < n && (is_ident_char(cs[i]) || ((cs[i] == '-' || cs[i] == '+') && (cs[i - 1] == 'e' || cs[i - 1] == 'E')))) {
+            while (i < n
+                && (is_ident_char(cs[i])
+                    || ((cs[i] == '-' || cs[i] == '+') && (cs[i - 1] == 'e' || cs[i - 1] == 'E')))) {
                 i = i + 1;
             }
             out.push(Token { tok: Tok.Int(cs.chars_to_string(start, i)), line: line });
@@ -256,7 +258,7 @@ fn option_value(p: Parser) -> Result<string, string> {
                     }
                 },
                 Tok.End => return Result.Err("${here(p)}: unterminated option aggregate"),
-                _ => {},
+                _ => { },
             }
         }
     }
@@ -294,7 +296,7 @@ fn option_name(p: Parser) -> Result<string, string> {
                     name = name + s;
                 }
             },
-            _ => {},
+            _ => { },
         }
         return Result.Ok(name);
     }
@@ -337,7 +339,7 @@ fn skip_statement(p: Parser) -> Result<int, string> {
     while (!is_sym(p, ';')) {
         match (advance(p)) {
             Tok.End => return Result.Err("${here(p)}: expected ';'"),
-            _ => {},
+            _ => { },
         }
     }
     advance(p);
@@ -362,7 +364,7 @@ fn new_field(name: string, number: int, label: int, type_word: string) -> schema
         oneof_index: -1,
         json_name: schema.json_name_of(name),
         proto3_optional: false,
-        packed_off: false,
+        packed_off: false
     }
 }
 
@@ -384,7 +386,11 @@ fn field(p: Parser, msg: schema.MessageDef, label: int, oneof: int) -> Result<in
     let number = int_value(p)?;
     let opts = field_options(p)?;
     expect_sym(p, ';')?;
-    let real_label = if (label == schema.L_REPEATED) { schema.L_REPEATED } else { schema.L_OPTIONAL };
+    let real_label = if (label == schema.L_REPEATED) {
+        schema.L_REPEATED
+    } else {
+        schema.L_OPTIONAL
+    };
     let f = new_field(name, number, real_label, type_word);
     f.oneof_index = oneof;
     apply_field_options(f, opts);
@@ -424,7 +430,12 @@ fn map_field(p: Parser, msg: schema.MessageDef) -> Result<int, string> {
 
 fn enum_body(p: Parser, scope: string) -> Result<schema.EnumDef, string> {
     let name = ident(p)?;
-    let e = schema.EnumDef { name: name, full_name: join_name(scope, name), values: [], allow_alias: false };
+    let e = schema.EnumDef {
+        name: name,
+        full_name: join_name(scope, name),
+        values: [],
+        allow_alias: false
+    };
     expect_sym(p, '{')?;
     while (!is_sym(p, '}')) {
         if (is_word(p, "option")) {
@@ -465,7 +476,7 @@ fn message_body(p: Parser, scope: string) -> Result<schema.MessageDef, string> {
     while (!is_sym(p, '}')) {
         match (peek(p)) {
             Tok.End => return Result.Err("${here(p)}: message ${name} is not closed"),
-            _ => {},
+            _ => { },
         }
         if (is_word(p, "message")) {
             advance(p);
@@ -564,20 +575,24 @@ fn service_body(p: Parser, package: string) -> Result<schema.ServiceDef, string>
                     } else if (is_sym(p, ';')) {
                         advance(p);
                     } else {
-                        return Result.Err("${here(p)}: unexpected ${describe(peek(p))} in rpc ${mname}");
+                        return Result.Err(
+                            "${here(p)}: unexpected ${describe(peek(p))} in rpc ${mname}"
+                        );
                     }
                 }
                 advance(p);
             } else {
                 expect_sym(p, ';')?;
             }
-            svc.methods.push(schema.MethodDef {
-                name: mname,
-                input_type: input,
-                output_type: output,
-                client_streaming: cs,
-                server_streaming: ss,
-            });
+            svc.methods.push(
+                schema.MethodDef {
+                    name: mname,
+                    input_type: input,
+                    output_type: output,
+                    client_streaming: cs,
+                    server_streaming: ss
+                }
+            );
         } else if (is_sym(p, ';')) {
             advance(p);
         } else {
@@ -597,7 +612,7 @@ pub fn parse_file(name: string, src: string) -> Result<schema.FileDef, string> {
     while (true) {
         match (peek(p)) {
             Tok.End => break,
-            _ => {},
+            _ => { },
         }
         if (is_word(p, "syntax") || is_word(p, "edition")) {
             let word = ident(p)?;
@@ -667,7 +682,7 @@ pub fn from_memory(files: [(string, string)]) -> Source {
 fn read_source(src: Source, name: string) -> Result<string, string> {
     match (src.memory.get(name)) {
         Option.Some(t) => return Result.Ok(t),
-        Option.None => {},
+        Option.None => { },
     }
     for dir in src.import_paths {
         let path = if (dir == "" || dir == ".") { name } else { "${dir}/${name}" };
@@ -692,7 +707,12 @@ pub fn load(src: Source, names: [string]) -> Result<schema.Registry, string> {
     Result.Ok(reg)
 }
 
-fn load_one(src: Source, reg: schema.Registry, name: string, stack: [string]) -> Result<int, string> {
+fn load_one(
+    src: Source,
+    reg: schema.Registry,
+    name: string,
+    stack: [string]
+) -> Result<int, string> {
     if (reg.files.contains_key(name)) {
         return Result.Ok(0);
     }
@@ -716,7 +736,12 @@ fn visible(reg: schema.Registry, f: schema.FileDef) -> [string] {
 }
 
 /// Resolves a type name used inside `scope` (a fully-qualified message name or package).
-fn resolve_name(reg: schema.Registry, files: [string], scope: string, name: string) -> Result<(string, int), string> {
+fn resolve_name(
+    reg: schema.Registry,
+    files: [string],
+    scope: string,
+    name: string
+) -> Result<(string, int), string> {
     if (name.starts_with(".")) {
         return lookup(reg, files, name.substring(1, name.len()));
     }
@@ -725,7 +750,7 @@ fn resolve_name(reg: schema.Registry, files: [string], scope: string, name: stri
         let candidate = join_name(s, name);
         match (lookup(reg, files, candidate)) {
             Result.Ok(x) => return Result.Ok(x),
-            Result.Err(_) => {},
+            Result.Err(_) => { },
         }
         if (s == "") {
             break;
@@ -752,7 +777,11 @@ fn lookup(reg: schema.Registry, files: [string], full: string) -> Result<(string
     Result.Err("not found")
 }
 
-fn resolve_message(reg: schema.Registry, files: [string], m: schema.MessageDef) -> Result<int, string> {
+fn resolve_message(
+    reg: schema.Registry,
+    files: [string],
+    m: schema.MessageDef
+) -> Result<int, string> {
     for f in m.fields {
         if (f.kind == 0) {
             let (full, kind) = resolve_name(reg, files, m.full_name, f.type_name)?;
@@ -776,7 +805,9 @@ fn resolve_file(reg: schema.Registry, f: schema.FileDef) -> Result<int, string> 
             let (input, ik) = resolve_name(reg, files, f.package, m.input_type)?;
             let (output, ok) = resolve_name(reg, files, f.package, m.output_type)?;
             if (ik != schema.T_MESSAGE || ok != schema.T_MESSAGE) {
-                return Result.Err("${f.name}: rpc ${s.name}.${m.name} must take and return messages");
+                return Result.Err(
+                    "${f.name}: rpc ${s.name}.${m.name} must take and return messages"
+                );
             }
             m.input_type = input;
             m.output_type = output;

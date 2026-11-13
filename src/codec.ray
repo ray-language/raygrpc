@@ -156,7 +156,11 @@ fn is_unsigned64(kind: int) -> bool {
 }
 
 fn is_64bit(kind: int) -> bool {
-    kind == schema.T_INT64 || kind == schema.T_UINT64 || kind == schema.T_FIXED64 || kind == schema.T_SFIXED64 || kind == schema.T_SINT64
+    kind == schema.T_INT64
+        || kind == schema.T_UINT64
+        || kind == schema.T_FIXED64
+        || kind == schema.T_SFIXED64
+        || kind == schema.T_SINT64
 }
 
 fn is_integer(kind: int) -> bool {
@@ -166,7 +170,13 @@ fn is_integer(kind: int) -> bool {
 // ---- decoding: bytes → JSON ----
 
 /// One scalar from its raw wire value, as a JSON value.
-fn scalar_json(reg: schema.Registry, f: schema.FieldDef, v: wire.Raw, opts: Options, depth: int) -> Result<json.Doc, string> {
+fn scalar_json(
+    reg: schema.Registry,
+    f: schema.FieldDef,
+    v: wire.Raw,
+    opts: Options,
+    depth: int
+) -> Result<json.Doc, string> {
     let k = f.kind;
     match (v) {
         wire.Raw.Varint(n) => {
@@ -300,7 +310,13 @@ fn map_key_text(d: json.Doc) -> string {
 }
 
 /// Decodes `data` as message `m` into a JSON object.
-pub fn decode_message(reg: schema.Registry, m: schema.MessageDef, data: bytes, opts: Options, depth: int) -> Result<json.Doc, string> {
+pub fn decode_message(
+    reg: schema.Registry,
+    m: schema.MessageDef,
+    data: bytes,
+    opts: Options,
+    depth: int
+) -> Result<json.Doc, string> {
     if (depth > MAX_DEPTH) {
         return Result.Err("message nesting deeper than ${MAX_DEPTH}");
     }
@@ -319,8 +335,9 @@ pub fn decode_message(reg: schema.Registry, m: schema.MessageDef, data: bytes, o
         let vs = match (present) {
             Option.Some(list) => list,
             Option.None => {
-                let has_presence = f.oneof_index >= 0 || f.kind == schema.T_MESSAGE && !schema.is_repeated(f);
-                if (opts.emit_defaults && !has_presence) {
+                // protojson's EmitUnpopulated: zero values, [] and {}, null for a message;
+                // oneof members and proto3 optionals stay out.
+                if (opts.emit_defaults && f.oneof_index < 0) {
                     members.push(json.Member { key: key, value: default_json(reg, f) });
                 }
                 continue;
@@ -348,7 +365,7 @@ pub fn decode_message(reg: schema.Registry, m: schema.MessageDef, data: bytes, o
                 if (vf.kind == schema.T_MESSAGE) {
                     match (vd) {
                         json.Doc.Null => vd = json.Doc.Obj([]),
-                        _ => {},
+                        _ => { },
                     }
                 }
                 // A repeated key: the last entry wins, in the position of the first.
@@ -381,7 +398,12 @@ pub fn decode_message(reg: schema.Registry, m: schema.MessageDef, data: bytes, o
                 }
             }
             let sub = schema.message(reg, f.type_name)?;
-            members.push(json.Member { key: key, value: decode_message(reg, sub, bytes_concat(parts), opts, depth + 1)? });
+            members.push(
+                json.Member {
+                    key: key,
+                    value: decode_message(reg, sub, bytes_concat(parts), opts, depth + 1)?
+                }
+            );
         } else {
             // Last one wins. A value with the wrong wire type is an unknown field (skipped),
             // as the protobuf runtimes do.
@@ -428,7 +450,12 @@ fn raw_is_zero(v: wire.Raw) -> bool {
 }
 
 /// Decodes a message by name.
-pub fn to_json(reg: schema.Registry, type_name: string, data: bytes, opts: Options) -> Result<json.Doc, string> {
+pub fn to_json(
+    reg: schema.Registry,
+    type_name: string,
+    data: bytes,
+    opts: Options
+) -> Result<json.Doc, string> {
     let m = schema.message(reg, type_name)?;
     decode_message(reg, m, data, opts, 0)
 }
@@ -452,7 +479,10 @@ fn int_from_doc(f: schema.FieldDef, d: json.Doc) -> Result<int, string> {
         json.Doc.Str(s) => s,
         other => return Result.Err("field ${f.name}: expected an integer, got ${doc_kind(other)}"),
     };
-    let v = match (parse_integer(text, is_unsigned64(f.kind) || f.kind == schema.T_UINT32 || f.kind == schema.T_FIXED32)) {
+    let v = match (parse_integer(
+        text,
+        is_unsigned64(f.kind) || f.kind == schema.T_UINT32 || f.kind == schema.T_FIXED32
+    )) {
         Result.Ok(x) => x,
         Result.Err(e) => return Result.Err("field ${f.name}: ${e}"),
     };
@@ -477,8 +507,12 @@ fn float_from_doc(f: schema.FieldDef, d: json.Doc) -> Result<float, string> {
             Option.None => return Result.Err("field ${f.name}: invalid number ${t}"),
         },
     };
-    if (f.kind == schema.T_FLOAT && v == v && v > -1.7976931348623157e308 && v < 1.7976931348623157e308) {
-        if (v > 3.4028234663852886e38 || v < -3.4028234663852886e38) {
+    if (f.kind == schema.T_FLOAT
+        && v == v
+        && v > -1.7976931348623157e308
+        && v < 1.7976931348623157e308) {
+        // Out of range = finite here but infinite once rounded to binary32.
+        if ((wire.f32_bits(v) & 0x7FFF_FFFF) == 0x7F80_0000) {
             return Result.Err("field ${f.name}: ${text} out of range for float");
         }
     }
@@ -520,7 +554,12 @@ enum Scalar {
     L(bytes),
 }
 
-fn scalar_of(reg: schema.Registry, f: schema.FieldDef, d: json.Doc, depth: int) -> Result<Scalar, string> {
+fn scalar_of(
+    reg: schema.Registry,
+    f: schema.FieldDef,
+    d: json.Doc,
+    depth: int
+) -> Result<Scalar, string> {
     let k = f.kind;
     match (k) {
         1 => Result.Ok(Scalar.F64(math.float_bits(float_from_doc(f, d)?))),
@@ -594,7 +633,13 @@ fn map_key_doc(kf: schema.FieldDef, key: string) -> json.Doc {
     }
 }
 
-fn encode_field(reg: schema.Registry, w: wire.Writer, f: schema.FieldDef, d: json.Doc, depth: int) -> Result<int, string> {
+fn encode_field(
+    reg: schema.Registry,
+    w: wire.Writer,
+    f: schema.FieldDef,
+    d: json.Doc,
+    depth: int
+) -> Result<int, string> {
     if (is_map_field(reg, f)) {
         let entry = schema.message(reg, f.type_name)?;
         let kf = schema.field_by_number(entry, 1).unwrap();
@@ -612,7 +657,7 @@ fn encode_field(reg: schema.Registry, w: wire.Writer, f: schema.FieldDef, d: jso
             put_scalar(ew, 1, ks);
             match (m.value) {
                 json.Doc.Null => return Result.Err("field ${f.name}: a map value cannot be null"),
-                _ => {},
+                _ => { },
             }
             let vs = scalar_of(reg, vf, m.value, depth)?;
             put_scalar(ew, 2, vs);
@@ -629,7 +674,7 @@ fn encode_field(reg: schema.Registry, w: wire.Writer, f: schema.FieldDef, d: jso
         for x in items {
             match (x) {
                 json.Doc.Null => return Result.Err("field ${f.name}: null inside a repeated field"),
-                _ => {},
+                _ => { },
             }
             ss.push(scalar_of(reg, f, x, depth)?);
         }
@@ -653,7 +698,12 @@ fn encode_field(reg: schema.Registry, w: wire.Writer, f: schema.FieldDef, d: jso
 }
 
 /// Encodes a JSON object as message `m`.
-pub fn encode_message(reg: schema.Registry, m: schema.MessageDef, d: json.Doc, depth: int) -> Result<bytes, string> {
+pub fn encode_message(
+    reg: schema.Registry,
+    m: schema.MessageDef,
+    d: json.Doc,
+    depth: int
+) -> Result<bytes, string> {
     if (depth > MAX_DEPTH) {
         return Result.Err("message nesting deeper than ${MAX_DEPTH}");
     }
@@ -675,12 +725,14 @@ pub fn encode_message(reg: schema.Registry, m: schema.MessageDef, d: json.Doc, d
         match (mem.value) {
             // null = the default (and clears a oneof member: it does not count as set).
             json.Doc.Null => continue,
-            _ => {},
+            _ => { },
         }
         if (f.oneof_index >= 0 && !f.proto3_optional) {
             match (oneof_set.get(f.oneof_index)) {
                 Option.Some(other) => {
-                    return Result.Err("oneof ${m.oneofs[f.oneof_index]} is already set by ${other}; cannot set ${f.name}");
+                    return Result.Err(
+                        "oneof ${m.oneofs[f.oneof_index]} is already set by ${other}; cannot set ${f.name}"
+                    );
                 },
                 Option.None => oneof_set.insert(f.oneof_index, f.name),
             }
@@ -693,7 +745,7 @@ pub fn encode_message(reg: schema.Registry, m: schema.MessageDef, d: json.Doc, d
             Option.Some(v) => {
                 encode_field(reg, w, f, v, depth)?;
             },
-            Option.None => {},
+            Option.None => { },
         }
     }
     Result.Ok(wire.finish(w))

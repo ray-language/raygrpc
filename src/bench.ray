@@ -6,6 +6,7 @@ import cli;
 import client;
 import codec;
 import h2client;
+import loader;
 import schema;
 import net/grpc_conn;
 import std/math;
@@ -19,7 +20,15 @@ struct WorkerResult {
 }
 
 /// One fiber: calls in a loop until `until` (monotonic ms).
-fn worker(host: string, port: int, plain: bool, engine: string, path: string, msg: bytes, until: int) -> WorkerResult {
+fn worker(
+    host: string,
+    port: int,
+    plain: bool,
+    engine: string,
+    path: string,
+    msg: bytes,
+    until: int
+) -> WorkerResult {
     let res = WorkerResult { calls: 0, errors: 0, latencies_us: [], first_error: "" };
     let md: Map<string, string> = Map.new();
     if (engine == "raygrpc") {
@@ -112,7 +121,14 @@ pub fn run(a: cli.Args) -> Result<int, string> {
     let svc_name = method_name.replace("/", ".");
     let svc = svc_name.substring(0, svc_name.last_index_of(".").unwrap_or(0));
     let md: Map<string, string> = Map.new();
-    let reg = client.schema_for(a, host, port, [svc], md)?;
+    // The demo schema is built in; anything else comes from -proto/-protoset or reflection
+    // (net/grpc_server has no reflection: give it -proto).
+    let demo = loader.demo_registry()?;
+    let reg = if (!loader.has_files(a) && schema.service(demo, svc).is_ok()) {
+        demo
+    } else {
+        client.schema_for(a, host, port, [svc], md)?
+    };
     let (s, m) = schema.method(reg, method_name)?;
     let msg = codec.from_json(reg, m.input_type, body)?;
     let path = "/${s.full_name}/${m.name}";
@@ -146,10 +162,14 @@ pub fn run(a: cli.Args) -> Result<int, string> {
     lat = sort(lat);
     let rate = if (elapsed > 0) { calls * 1000 / elapsed } else { 0 };
     print("method       ${path}");
-    print("client       ${if (engine == "raygrpc") { "raygrpc (net/grpc_h2)" } else { "net/grpc_conn" }}, ${conc} fibers, 1 connection each, ${if (plain) { "h2c" } else { "TLS" }}");
+    print(
+        "client       ${if (engine == "raygrpc") { "raygrpc (net/grpc_h2)" } else { "net/grpc_conn" }}, ${conc} fibers, 1 connection each, ${if (plain) { "h2c" } else { "TLS" }}"
+    );
     print("calls        ${calls} ok, ${errors} errors in ${elapsed} ms");
     print("rate         ${rate} calls/s");
-    print("latency      p50 ${percentile(lat, 50)} us, p90 ${percentile(lat, 90)} us, p99 ${percentile(lat, 99)} us, max ${percentile(lat, 100)} us");
+    print(
+        "latency      p50 ${percentile(lat, 50)} us, p90 ${percentile(lat, 90)} us, p99 ${percentile(lat, 99)} us, max ${percentile(lat, 100)} us"
+    );
     if (first_error != "") {
         print("first error  ${first_error}");
     }

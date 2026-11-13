@@ -19,7 +19,15 @@ fn ask(ix: reflection.Index, a: reflection.Ask) -> reflection.Answer {
 @test
 fn list_services_names_every_service() {
     match (ask(index(), reflection.Ask.ListServices("*"))) {
-        reflection.Answer.Services(names) => assert_eq(names, ["grpc.reflection.v1.ServerReflection", "raygrpc.demo.Echo", "raygrpc.demo.Greeter", "raygrpc.demo.KeyValue"]),
+        reflection.Answer.Services(names) => assert_eq(
+            names,
+            [
+                "grpc.reflection.v1.ServerReflection",
+                "raygrpc.demo.Echo",
+                "raygrpc.demo.Greeter",
+                "raygrpc.demo.KeyValue"
+            ]
+        ),
         _ => panic("expected services"),
     }
 }
@@ -27,7 +35,12 @@ fn list_services_names_every_service() {
 @test
 fn a_symbol_comes_with_its_dependencies_first() {
     let ix = index();
-    for sym in ["raygrpc.demo.Echo", "raygrpc.demo.Echo.Echo", "raygrpc.demo.Everything.Nested.Inner", "raygrpc.demo.Everything.f_uint64"] {
+    for sym in [
+        "raygrpc.demo.Echo",
+        "raygrpc.demo.Echo.Echo",
+        "raygrpc.demo.Everything.Nested.Inner",
+        "raygrpc.demo.Everything.f_uint64"
+    ] {
         match (ask(ix, reflection.Ask.ContainingSymbol(sym))) {
             reflection.Answer.Files(fs) => {
                 assert_eq(fs.len(), 2);
@@ -73,7 +86,10 @@ fn unknown_names_are_not_found() {
 @test
 fn the_response_echoes_the_request() {
     let ix = index();
-    let req = reflection.Request { host: "example:1", ask: reflection.Ask.ByFilename("demo.proto") };
+    let req = reflection.Request {
+        host: "example:1",
+        ask: reflection.Ask.ByFilename("demo.proto")
+    };
     let out = reflection.answer_bytes(ix, wire.encode(req)).unwrap();
     let resp = wire.decode_into(reflection.empty_response(), out).unwrap();
     assert_eq(resp.valid_host, "example:1");

@@ -148,7 +148,10 @@ impl wire.Message for EchoReply {
         match (t.field) {
             1 => self.message = wire.string_of(r, t)?,
             2 => {
-                let e = wire.decode_into(StringEntry { key: "", value: "" }, wire.bytes_of_field(r, t)?)?;
+                let e = wire.decode_into(
+                    StringEntry { key: "", value: "" },
+                    wire.bytes_of_field(r, t)?
+                )?;
                 self.metadata.insert(e.key, e.value);
             },
             3 => self.payload = wire.bytes_of_field(r, t)?,
@@ -283,24 +286,48 @@ fn echo(c: server.Call) -> Result<server.Answer, grpc_status.Status> {
             if (left > 0) {
                 time.sleep(left);
             }
-            return Result.Err(grpc_status.new(grpc_status.DEADLINE_EXCEEDED, "echo: the ${req.delay_ms} ms delay outlives the deadline"));
+            return Result.Err(
+                grpc_status.new(
+                    grpc_status.DEADLINE_EXCEEDED,
+                    "echo: the ${req.delay_ms} ms delay outlives the deadline"
+                )
+            );
         }
         time.sleep(req.delay_ms);
     }
     if (req.code != 0) {
         if (req.code < 0 || req.code > 16) {
-            return Result.Err(grpc_status.new(grpc_status.INVALID_ARGUMENT, "code ${req.code} is not a gRPC status"));
+            return Result.Err(
+                grpc_status.new(
+                    grpc_status.INVALID_ARGUMENT,
+                    "code ${req.code} is not a gRPC status"
+                )
+            );
         }
-        return Result.Err(grpc_status.new(req.code, if (req.message != "") { req.message } else { grpc_status.code_name(req.code) }));
+        return Result.Err(
+            grpc_status.new(
+                req.code,
+                if (req.message != "") { req.message } else { grpc_status.code_name(req.code) }
+            )
+        );
     }
     let md: Map<string, string> = Map.new();
     for (k, v) in c.metadata {
-        if (k != "content-type" && k != "te" && k != "user-agent" && k != "grpc-timeout" && k != "grpc-accept-encoding") {
+        if (k != "content-type"
+            && k != "te"
+            && k != "user-agent"
+            && k != "grpc-timeout"
+            && k != "grpc-accept-encoding") {
             md.insert(k, v);
         }
     }
     let left = if (c.deadline > 0) { c.deadline - time.monotonic() } else { 0 };
-    let reply = EchoReply { message: req.message, metadata: md, payload: req.payload, deadline_ms: left };
+    let reply = EchoReply {
+        message: req.message,
+        metadata: md,
+        payload: req.payload,
+        deadline_ms: left
+    };
     let a = server.answer(wire.encode(reply));
     a.headers.insert("x-raygrpc-server", "0.1");
     // Metadata named echo-* comes back as trailers.
@@ -383,7 +410,11 @@ fn kv_list(c: server.Call, kv: Channel<KvMsg>) -> Result<server.Answer, grpc_sta
 }
 
 /// Routes one call of the demo services.
-pub fn handle(c: server.Call, kv: Channel<KvMsg>, reg: schema.Registry) -> Result<server.Answer, grpc_status.Status> {
+pub fn handle(
+    c: server.Call,
+    kv: Channel<KvMsg>,
+    reg: schema.Registry
+) -> Result<server.Answer, grpc_status.Status> {
     match (c.path) {
         "/raygrpc.demo.Greeter/SayHello" => say_hello(c),
         "/raygrpc.demo.Echo/Echo" => echo(c),

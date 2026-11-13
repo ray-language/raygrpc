@@ -7,8 +7,11 @@ import schema;
 import wire;
 
 pub const PATH_V1: string = "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo";
+
 pub const PATH_V1ALPHA: string = "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo";
+
 pub const SERVICE_V1: string = "grpc.reflection.v1.ServerReflection";
+
 pub const SERVICE_V1ALPHA: string = "grpc.reflection.v1alpha.ServerReflection";
 
 pub enum Ask {
@@ -83,7 +86,7 @@ impl wire.Message for Request {
             wire.write_string(w, 1, self.host);
         }
         match (self.ask) {
-            Ask.Nothing => {},
+            Ask.Nothing => { },
             Ask.ByFilename(s) => wire.write_string(w, 3, s),
             Ask.ContainingSymbol(s) => wire.write_string(w, 4, s),
             Ask.ContainingExtension(t, n) => wire.write_message(w, 5, ExtensionRequest { containing_type: t, number: n }),
@@ -98,7 +101,10 @@ impl wire.Message for Request {
             3 => self.ask = Ask.ByFilename(wire.string_of(r, t)?),
             4 => self.ask = Ask.ContainingSymbol(wire.string_of(r, t)?),
             5 => {
-                let e = wire.decode_into(ExtensionRequest { containing_type: "", number: 0 }, wire.bytes_of_field(r, t)?)?;
+                let e = wire.decode_into(
+                    ExtensionRequest { containing_type: "", number: 0 },
+                    wire.bytes_of_field(r, t)?
+                )?;
                 self.ask = Ask.ContainingExtension(e.containing_type, e.number);
             },
             6 => self.ask = Ask.ExtensionNumbers(wire.string_of(r, t)?),
@@ -150,7 +156,7 @@ fn decode_answer(field: int, b: bytes) -> Result<Answer, string> {
             for f in raw {
                 match (f.value) {
                     wire.Raw.Bytes(x) => files.push(x),
-                    _ => {},
+                    _ => { },
                 }
             }
             Result.Ok(Answer.Files(files))
@@ -168,7 +174,7 @@ fn decode_answer(field: int, b: bytes) -> Result<Answer, string> {
                         }
                     },
                     wire.Raw.Varint(n) => ns.push(n),
-                    _ => {},
+                    _ => { },
                 }
             }
             Result.Ok(Answer.ExtensionNumbers(base, ns))
@@ -181,11 +187,11 @@ fn decode_answer(field: int, b: bytes) -> Result<Answer, string> {
                         for g in wire.parse_raw(x)? {
                             match (g.value) {
                                 wire.Raw.Bytes(n) => names.push(from_utf8(n).unwrap_or("")),
-                                _ => {},
+                                _ => { },
                             }
                         }
                     },
-                    _ => {},
+                    _ => { },
                 }
             }
             Result.Ok(Answer.Services(names))
@@ -197,7 +203,7 @@ fn decode_answer(field: int, b: bytes) -> Result<Answer, string> {
                 match (f.value) {
                     wire.Raw.Varint(n) => code = wire.to_i32(n),
                     wire.Raw.Bytes(x) => msg = from_utf8(x).unwrap_or(""),
-                    _ => {},
+                    _ => { },
                 }
             }
             Result.Ok(Answer.Error(code, msg))
@@ -281,7 +287,9 @@ fn closure_into(ix: Index, file: string, order: [string]) {
 
 /// gRPC status codes used in error responses.
 const NOT_FOUND: int = 5;
+
 const UNIMPLEMENTED: int = 12;
+
 const INVALID_ARGUMENT: int = 3;
 
 pub fn answer(ix: Index, req: Request) -> Response {

@@ -69,11 +69,17 @@ pub fn run(a: cli.Args) -> Result<int, string> {
         }
         let l = grpc_server.bind(host, port)?;
         announce(a, host, l.port, mode, "net/grpc_server", false)?;
-        grpc_server.serve_router_until(l, stop, grpc_server.default_options(), fn() -> grpc_server.Router {
-            grpc_server.router().fallback(fn(c: grpc_server.Call) -> Result<bytes, grpc_status.Status> {
-                to_bytes_result(demo.handle(c, kv, reg))
-            })
-        })?;
+        grpc_server.serve_router_until(
+            l,
+            stop,
+            grpc_server.default_options(),
+            fn() -> grpc_server.Router {
+                grpc_server.router()
+                    .fallback(fn(c: grpc_server.Call) -> Result<bytes, grpc_status.Status> {
+                    to_bytes_result(demo.handle(c, kv, reg))
+                })
+            }
+        )?;
         return Result.Ok(0);
     }
     if (engine != "raygrpc") {
@@ -87,16 +93,28 @@ pub fn run(a: cli.Args) -> Result<int, string> {
         reflection: reflect,
         index: reflection.index_of(reg),
         max_message: grpc_server.DEFAULT_MAX_MESSAGE,
-        quiet: cli.has(a, "quiet"),
+        quiet: cli.has(a, "quiet")
     };
     announce(a, host, net.local_port(listener), mode, "raygrpc", reflect)?;
-    server.serve(listener, cfg, stop, fn(c: server.Call) -> Result<server.Answer, grpc_status.Status> {
-        demo.handle(c, kv, reg)
-    })?;
+    server.serve(
+        listener,
+        cfg,
+        stop,
+        fn(c: server.Call) -> Result<server.Answer, grpc_status.Status> {
+            demo.handle(c, kv, reg)
+        }
+    )?;
     Result.Ok(0)
 }
 
-fn announce(a: cli.Args, host: string, port: int, mode: string, engine: string, reflect: bool) -> Result<int, string> {
+fn announce(
+    a: cli.Args,
+    host: string,
+    port: int,
+    mode: string,
+    engine: string,
+    reflect: bool
+) -> Result<int, string> {
     let pf = cli.value_or(a, "port-file", "");
     if (pf != "") {
         fs.write_file(pf, "${port}\n")?;
@@ -107,7 +125,17 @@ fn announce(a: cli.Args, host: string, port: int, mode: string, engine: string, 
 }
 
 /// net/grpc_server has no TLS listener: accept, wrap in TLS ourselves, hand it to serve_conn.
-fn serve_net_tls(host: string, port: int, cert: string, key: string, reg: schema.Registry, kv: Channel<demo.KvMsg>, stop: Channel<int>, a: cli.Args, mode: string) -> Result<int, string> {
+fn serve_net_tls(
+    host: string,
+    port: int,
+    cert: string,
+    key: string,
+    reg: schema.Registry,
+    kv: Channel<demo.KvMsg>,
+    stop: Channel<int>,
+    a: cli.Args,
+    mode: string
+) -> Result<int, string> {
     let listener = net.tcp_listen(host, port)?;
     announce(a, host, net.local_port(listener), mode, "net/grpc_server", false)?;
     let conns: Channel<int> = Channel.bounded(64);
@@ -129,7 +157,8 @@ fn serve_net_tls(host: string, port: int, cert: string, key: string, reg: schema
                     spawn(fn() {
                         match (net.tls_accept(h, cert, key)) {
                             Result.Ok(t) => {
-                                let r = grpc_server.router().fallback(fn(c: grpc_server.Call) -> Result<bytes, grpc_status.Status> {
+                                let r = grpc_server.router()
+                                    .fallback(fn(c: grpc_server.Call) -> Result<bytes, grpc_status.Status> {
                                     to_bytes_result(demo.handle(c, kv, reg))
                                 });
                                 grpc_server.serve_conn(t, grpc_server.default_options(), r);

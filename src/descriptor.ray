@@ -94,7 +94,7 @@ impl wire.Message for schema.FieldDef {
                     if (o.field == 2) {
                         match (o.value) {
                             wire.Raw.Varint(v) => self.packed_off = v == 0,
-                            _ => {},
+                            _ => { },
                         }
                     }
                 }
@@ -161,7 +161,7 @@ impl wire.Message for schema.MessageDef {
                     if (o.field == 7) {
                         match (o.value) {
                             wire.Raw.Varint(v) => self.map_entry = v != 0,
-                            _ => {},
+                            _ => { },
                         }
                     }
                 }
@@ -246,7 +246,9 @@ impl wire.Message for schema.FileDef {
             1 => self.name = wire.string_of(r, t)?,
             2 => self.package = wire.string_of(r, t)?,
             3 => self.dependencies.push(wire.string_of(r, t)?),
-            4 => self.messages.push(wire.decode_into(schema.new_message("", ""), wire.bytes_of_field(r, t)?)?),
+            4 => self.messages.push(
+                wire.decode_into(schema.new_message("", ""), wire.bytes_of_field(r, t)?)?
+            ),
             5 => self.enums.push(wire.decode_into(empty_enum(), wire.bytes_of_field(r, t)?)?),
             6 => self.services.push(wire.decode_into(empty_service(), wire.bytes_of_field(r, t)?)?),
             12 => self.syntax = wire.string_of(r, t)?,
@@ -274,12 +276,18 @@ fn empty_field() -> schema.FieldDef {
         oneof_index: -1,
         json_name: "",
         proto3_optional: false,
-        packed_off: false,
+        packed_off: false
     }
 }
 
 fn empty_method() -> schema.MethodDef {
-    schema.MethodDef { name: "", input_type: "", output_type: "", client_streaming: false, server_streaming: false }
+    schema.MethodDef {
+        name: "",
+        input_type: "",
+        output_type: "",
+        client_streaming: false,
+        server_streaming: false
+    }
 }
 
 fn empty_service() -> schema.ServiceDef {

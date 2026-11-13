@@ -106,7 +106,9 @@ fn decode_raw_cmd() -> Result<int, string> {
 fn protoset_cmd(a: cli.Args) -> Result<int, string> {
     let out = cli.value_or(a, "o", "");
     if (out == "") {
-        return Result.Err("usage: raygrpc protoset -proto FILE [-import-path DIR] -o OUT [-include-imports]");
+        return Result.Err(
+            "usage: raygrpc protoset -proto FILE [-import-path DIR] -o OUT [-include-imports]"
+        );
     }
     let reg = loader.from_files(a)?;
     var names: [string] = [];
@@ -218,7 +220,7 @@ fn main() -> int {
     let argv = args();
     match (with_cacert(argv)) {
         Option.Some(code) => return code,
-        Option.None => {},
+        Option.None => { },
     }
     match (dispatch(argv)) {
         Result.Ok(code) => code,

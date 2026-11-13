@@ -13,7 +13,11 @@ import std/embed;
 import std/fs;
 
 /// The embedded protos (`[native] embed = ["proto"]` in ray.toml), keyed as imported.
-pub const DEMO_FILES: [string] = ["common.proto", "demo.proto", "grpc/reflection/v1/reflection.proto"];
+pub const DEMO_FILES: [string] = [
+    "common.proto",
+    "demo.proto",
+    "grpc/reflection/v1/reflection.proto"
+];
 
 pub fn demo_registry() -> Result<schema.Registry, string> {
     var files: [(string, string)] = [];
@@ -67,7 +71,7 @@ pub fn from_files(a: cli.Args) -> Result<schema.Registry, string> {
                         name = rest;
                         break;
                     },
-                    Option.None => {},
+                    Option.None => { },
                 }
             }
             names.push(name);
@@ -86,9 +90,18 @@ pub struct Reflector {
     timeout_ms: int,
 }
 
-pub fn open_reflection(s: h2client.Session, md: Map<string, string>, timeout_ms: int) -> Result<Reflector, string> {
-    let r = Reflector { session: s, stream: 0, path: reflection.PATH_V1, timeout_ms: timeout_ms };
-    r.stream = h2client.open(s, r.path, md, timeout_ms)?;
+/// Without -max-time the reflection stream still gets a deadline: a server that only does
+/// unary calls (net/grpc_server) never answers a stream that stays open.
+pub const REFLECTION_TIMEOUT_MS: int = 10000;
+
+pub fn open_reflection(
+    s: h2client.Session,
+    md: Map<string, string>,
+    timeout_ms: int
+) -> Result<Reflector, string> {
+    let t = if (timeout_ms > 0) { timeout_ms } else { REFLECTION_TIMEOUT_MS };
+    let r = Reflector { session: s, stream: 0, path: reflection.PATH_V1, timeout_ms: t };
+    r.stream = h2client.open(s, r.path, md, t)?;
     Result.Ok(r)
 }
 
@@ -97,7 +110,7 @@ pub fn ask(r: Reflector, a: reflection.Ask) -> Result<reflection.Answer, string>
     h2client.send_msg(r.session, r.stream, msg, false)?;
     while (true) {
         match (h2client.next(r.session, r.stream)?) {
-            h2client.Event.Headers(_) => {},
+            h2client.Event.Headers(_) => { },
             h2client.Event.Message(b) => {
                 let resp = wire.decode_into(reflection.empty_response(), b)?;
                 return Result.Ok(resp.answer);

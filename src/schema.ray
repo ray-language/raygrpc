@@ -4,27 +4,46 @@
 
 /// Field types, numbered as `FieldDescriptorProto.Type`.
 pub const T_DOUBLE: int = 1;
+
 pub const T_FLOAT: int = 2;
+
 pub const T_INT64: int = 3;
+
 pub const T_UINT64: int = 4;
+
 pub const T_INT32: int = 5;
+
 pub const T_FIXED64: int = 6;
+
 pub const T_FIXED32: int = 7;
+
 pub const T_BOOL: int = 8;
+
 pub const T_STRING: int = 9;
+
 pub const T_GROUP: int = 10;
+
 pub const T_MESSAGE: int = 11;
+
 pub const T_BYTES: int = 12;
+
 pub const T_UINT32: int = 13;
+
 pub const T_ENUM: int = 14;
+
 pub const T_SFIXED32: int = 15;
+
 pub const T_SFIXED64: int = 16;
+
 pub const T_SINT32: int = 17;
+
 pub const T_SINT64: int = 18;
 
 /// Labels, numbered as `FieldDescriptorProto.Label`.
 pub const L_OPTIONAL: int = 1;
+
 pub const L_REQUIRED: int = 2;
+
 pub const L_REPEATED: int = 3;
 
 pub struct FieldDef {
@@ -90,11 +109,27 @@ pub struct FileDef {
 }
 
 pub fn new_message(name: string, full_name: string) -> MessageDef {
-    MessageDef { name: name, full_name: full_name, fields: [], nested: [], enums: [], oneofs: [], map_entry: false }
+    MessageDef {
+        name: name,
+        full_name: full_name,
+        fields: [],
+        nested: [],
+        enums: [],
+        oneofs: [],
+        map_entry: false
+    }
 }
 
 pub fn new_file(name: string) -> FileDef {
-    FileDef { name: name, package: "", dependencies: [], messages: [], enums: [], services: [], syntax: "proto3" }
+    FileDef {
+        name: name,
+        package: "",
+        dependencies: [],
+        messages: [],
+        enums: [],
+        services: [],
+        syntax: "proto3"
+    }
 }
 
 /// protoc's default JSON name: drop underscores, upper-case the letter after each one.
@@ -192,7 +227,7 @@ pub fn registry() -> Registry {
         messages: messages,
         enums: enums,
         services: services,
-        symbol_file: symbol_file,
+        symbol_file: symbol_file
     }
 }
 
@@ -343,7 +378,7 @@ fn closure_into(reg: Registry, file: string, seen: [string]) {
             }
             seen.push(file);
         },
-        Option.None => {},
+        Option.None => { },
     }
 }
 

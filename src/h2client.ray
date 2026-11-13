@@ -56,7 +56,9 @@ pub fn dial(host: string, port: int, t: Transport, connect_ms: int) -> Result<Se
         Transport.Plain => "http",
         _ => "https",
     };
-    Result.Ok(Session { link: link, authority: "${host}:${port}", scheme: scheme, next_id: 1, buf: [] })
+    Result.Ok(
+        Session { link: link, authority: "${host}:${port}", scheme: scheme, next_id: 1, buf: [] }
+    )
 }
 
 pub fn hangup(s: Session) {
@@ -77,7 +79,12 @@ pub fn timeout_header(ms: int) -> string {
 }
 
 /// Opens a stream for `path` and sends the request headers.
-pub fn open(s: Session, path: string, metadata: Map<string, string>, timeout_ms: int) -> Result<int, string> {
+pub fn open(
+    s: Session,
+    path: string,
+    metadata: Map<string, string>,
+    timeout_ms: int
+) -> Result<int, string> {
     let id = s.next_id;
     s.next_id = s.next_id + 2;
     var hs = [
@@ -87,7 +94,7 @@ pub fn open(s: Session, path: string, metadata: Map<string, string>, timeout_ms:
         h2.hdr(":authority", s.authority),
         h2.hdr("content-type", "application/grpc"),
         h2.hdr("te", "trailers"),
-        h2.hdr("user-agent", "raygrpc/0.1"),
+        h2.hdr("user-agent", "raygrpc/0.1")
     ];
     if (timeout_ms > 0) {
         hs.push(h2.hdr("grpc-timeout", timeout_header(timeout_ms)));
@@ -107,7 +114,9 @@ pub fn open(s: Session, path: string, metadata: Map<string, string>, timeout_ms:
 /// Sends one request message; `last` half-closes the stream.
 pub fn send_msg(s: Session, id: int, msg: bytes, last: bool) -> Result<int, string> {
     let pending: [h2.Frame] = [];
-    let ok = h2.send_data(s.link, id, protobuf.grpc_frame(msg), last, fn(f: h2.Frame) -> Result<int, string> {
+    let ok = h2.send_data(s.link, id, protobuf.grpc_frame(
+        msg
+    ), last, fn(f: h2.Frame) -> Result<int, string> {
         pending.push(f);
         Result.Ok(0)
     })?;
@@ -174,7 +183,7 @@ fn end_of(m: Map<string, string>) -> Event {
 pub fn next(s: Session, id: int) -> Result<Event, string> {
     match (next_message(s)) {
         Option.Some(m) => return Result.Ok(Event.Message(m)),
-        Option.None => {},
+        Option.None => { },
     }
     while (true) {
         let fr = match (h2.read_frame(s.link)) {
@@ -208,11 +217,19 @@ pub fn next(s: Session, id: int) -> Result<Event, string> {
             let st = m.get_or(":status", "");
             if (st != "200") {
                 h2.close_stream(s.link, id);
-                return Result.Ok(Event.End(http_to_grpc(st), "unexpected HTTP status code received from server: ${st}", m));
+                return Result.Ok(
+                    Event.End(
+                        http_to_grpc(st),
+                        "unexpected HTTP status code received from server: ${st}",
+                        m
+                    )
+                );
             }
             if ((fr.flags & h2.END_STREAM) != 0) {
                 h2.close_stream(s.link, id);
-                return Result.Ok(Event.End(13, "server closed the stream without sending trailers", m));
+                return Result.Ok(
+                    Event.End(13, "server closed the stream without sending trailers", m)
+                );
             }
             return Result.Ok(Event.Headers(m));
         }
@@ -221,17 +238,25 @@ pub fn next(s: Session, id: int) -> Result<Event, string> {
             s.buf.push(fr.payload);
             match (next_message(s)) {
                 Option.Some(m) => return Result.Ok(Event.Message(m)),
-                Option.None => {},
+                Option.None => { },
             }
             if ((fr.flags & h2.END_STREAM) != 0) {
                 h2.close_stream(s.link, id);
                 let none: Map<string, string> = Map.new();
-                return Result.Ok(Event.End(13, "server closed the stream without sending trailers", none));
+                return Result.Ok(
+                    Event.End(13, "server closed the stream without sending trailers", none)
+                );
             }
         } else if (fr.ftype == h2.RST_STREAM) {
             h2.close_stream(s.link, id);
             let none: Map<string, string> = Map.new();
-            return Result.Ok(Event.End(13, "stream terminated by RST_STREAM with error code: ${http2.rst_error_code(fr.payload)}", none));
+            return Result.Ok(
+                Event.End(
+                    13,
+                    "stream terminated by RST_STREAM with error code: ${http2.rst_error_code(fr.payload)}",
+                    none
+                )
+            );
         }
     }
 }
@@ -259,12 +284,24 @@ pub struct Reply {
     trailers: Map<string, string>,
 }
 
-pub fn unary(s: Session, path: string, msg: bytes, metadata: Map<string, string>, timeout_ms: int) -> Result<Reply, string> {
+pub fn unary(
+    s: Session,
+    path: string,
+    msg: bytes,
+    metadata: Map<string, string>,
+    timeout_ms: int
+) -> Result<Reply, string> {
     let id = open(s, path, metadata, timeout_ms)?;
     send_msg(s, id, msg, true)?;
     let headers: Map<string, string> = Map.new();
     let none: Map<string, string> = Map.new();
-    let r = Reply { headers: headers, message: bytes_of([]), code: 2, status_message: "", trailers: none };
+    let r = Reply {
+        headers: headers,
+        message: bytes_of([]),
+        code: 2,
+        status_message: "",
+        trailers: none
+    };
     var got = 0;
     while (true) {
         match (next(s, id)?) {

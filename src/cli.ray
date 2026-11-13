@@ -15,7 +15,7 @@ const SWITCHES: [string] = [
     "no-reflection",
     "quiet",
     "help",
-    "h",
+    "h"
 ];
 
 pub struct Args {
@@ -43,7 +43,7 @@ pub fn parse(argv: [string]) -> Result<Args, string> {
                     name = name.substring(0, eq);
                     has_value = true;
                 },
-                Option.None => {},
+                Option.None => { },
             }
             if (SWITCHES.contains(name)) {
                 if (has_value && value != "true") {
