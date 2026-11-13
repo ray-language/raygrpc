@@ -25,7 +25,7 @@ start() {
     local name=$1
     shift
     local pf="$OUT/$name.port"
-    "$@" -port 0 -port-file "$pf" -for 600 -quiet >"$OUT/$name.log" 2>&1 &
+    "$@" -port 0 -port-file "$pf" -for 120 -quiet >"$OUT/$name.log" 2>&1 &
     PIDS+=("$!")
     PORT=""
     for _ in $(seq 1 200); do
@@ -48,9 +48,9 @@ start native-raygrpc "$RAYGRPC" serve
 P1=$PORT
 start native-net "$RAYGRPC" serve -engine net
 P2=$PORT
-start vm-raygrpc vm serve
+start vm-raygrpc ray run src/main.ray serve
 P3=$PORT
-start vm-net vm serve -engine net
+start vm-net ray run src/main.ray serve -engine net
 P4=$PORT
 for srv in "native server, raygrpc engine:$P1" "native server, net/grpc_server:$P2" "VM server, raygrpc engine:$P3" "VM server, net/grpc_server:$P4"; do
     name=${srv%%:*}
