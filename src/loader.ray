@@ -1,0 +1,180 @@
+//! Where a schema comes from: .proto files (-proto, -import-path), a descriptor set written
+//! by `protoc --descriptor_set_out` (-protoset), the server's reflection service, or the
+//! demo protos embedded in the binary.
+
+import cli;
+import descriptor;
+import h2client;
+import proto_parser;
+import reflection;
+import schema;
+import wire;
+import std/embed;
+import std/fs;
+
+/// The embedded protos (`[native] embed = ["proto"]` in ray.toml), keyed as imported.
+pub const DEMO_FILES: [string] = ["common.proto", "demo.proto", "grpc/reflection/v1/reflection.proto"];
+
+pub fn demo_registry() -> Result<schema.Registry, string> {
+    var files: [(string, string)] = [];
+    for name in DEMO_FILES {
+        let b = embed.read("proto/${name}")?;
+        files.push((name, from_utf8(b)?));
+    }
+    proto_parser.load(proto_parser.from_memory(files), DEMO_FILES)
+}
+
+/// True when the flags name a schema source other than the server.
+pub fn has_files(a: cli.Args) -> bool {
+    cli.values(a, "proto").len() > 0 || cli.values(a, "protoset").len() > 0
+}
+
+fn dir_of(path: string) -> string {
+    match (path.last_index_of("/")) {
+        Option.Some(i) => path.substring(0, i),
+        Option.None => ".",
+    }
+}
+
+/// The registry described by -proto/-import-path or -protoset.
+pub fn from_files(a: cli.Args) -> Result<schema.Registry, string> {
+    let sets = cli.values(a, "protoset");
+    if (sets.len() > 0) {
+        var files: [schema.FileDef] = [];
+        for p in sets {
+            let b = fs.read_file_bytes(p)?;
+            files = files + descriptor.decode_set(b)?;
+        }
+        return Result.Ok(descriptor.registry_of(files));
+    }
+    let protos = cli.values(a, "proto");
+    var paths = cli.values(a, "import-path");
+    var names: [string] = [];
+    for p in protos {
+        if (paths.len() == 0) {
+            // Like grpcurl: without -import-path the file's own directory is the root.
+            let d = dir_of(p);
+            if (!paths.contains(d)) {
+                paths.push(d);
+            }
+            names.push(if (d == ".") { p } else { p.substring(d.len() + 1, p.len()) });
+        } else {
+            var name = p;
+            for root in paths {
+                let prefix = if (root.ends_with("/")) { root } else { root + "/" };
+                match (p.strip_prefix(prefix)) {
+                    Option.Some(rest) => {
+                        name = rest;
+                        break;
+                    },
+                    Option.None => {},
+                }
+            }
+            names.push(name);
+        }
+    }
+    proto_parser.load(proto_parser.from_dirs(paths), names)
+}
+
+// ---- reflection client ----
+
+/// One reflection stream: v1 first, v1alpha when the server does not know v1.
+pub struct Reflector {
+    session: h2client.Session,
+    stream: int,
+    path: string,
+    timeout_ms: int,
+}
+
+pub fn open_reflection(s: h2client.Session, md: Map<string, string>, timeout_ms: int) -> Result<Reflector, string> {
+    let r = Reflector { session: s, stream: 0, path: reflection.PATH_V1, timeout_ms: timeout_ms };
+    r.stream = h2client.open(s, r.path, md, timeout_ms)?;
+    Result.Ok(r)
+}
+
+pub fn ask(r: Reflector, a: reflection.Ask) -> Result<reflection.Answer, string> {
+    let msg = wire.encode(reflection.request(a));
+    h2client.send_msg(r.session, r.stream, msg, false)?;
+    while (true) {
+        match (h2client.next(r.session, r.stream)?) {
+            h2client.Event.Headers(_) => {},
+            h2client.Event.Message(b) => {
+                let resp = wire.decode_into(reflection.empty_response(), b)?;
+                return Result.Ok(resp.answer);
+            },
+            h2client.Event.End(code, text, _) => {
+                if (code == 12 && r.path == reflection.PATH_V1) {
+                    // No v1: retry the same question on v1alpha.
+                    r.path = reflection.PATH_V1ALPHA;
+                    let md: Map<string, string> = Map.new();
+                    r.stream = h2client.open(r.session, r.path, md, r.timeout_ms)?;
+                    h2client.send_msg(r.session, r.stream, msg, false)?;
+                    continue;
+                }
+                if (code == 12) {
+                    return Result.Err("server does not support the reflection API");
+                }
+                return Result.Err("reflection failed: ${code} ${text}");
+            },
+        }
+    }
+}
+
+pub fn finish_reflection(r: Reflector) {
+    h2client.close_send(r.session, r.stream);
+}
+
+pub fn list_services(r: Reflector) -> Result<[string], string> {
+    match (ask(r, reflection.Ask.ListServices("*"))?) {
+        reflection.Answer.Services(names) => Result.Ok(sort(names)),
+        reflection.Answer.Error(code, msg) => Result.Err("reflection error ${code}: ${msg}"),
+        _ => Result.Err("unexpected reflection answer to list_services"),
+    }
+}
+
+fn add_answer(reg: schema.Registry, a: reflection.Answer, what: string) -> Result<int, string> {
+    match (a) {
+        reflection.Answer.Files(fs) => {
+            for b in fs {
+                schema.add_file(reg, descriptor.decode_file(b)?);
+            }
+            Result.Ok(0)
+        },
+        reflection.Answer.Error(code, msg) => {
+            if (code == 5) {
+                return Result.Err("Symbol not found: ${what}");
+            }
+            Result.Err("reflection error ${code}: ${msg}")
+        },
+        _ => Result.Err("unexpected reflection answer for ${what}"),
+    }
+}
+
+/// Fetches the file declaring `symbol` and every dependency it names, into `reg`.
+pub fn fetch_symbol(r: Reflector, reg: schema.Registry, symbol: string) -> Result<int, string> {
+    if (schema.file_of_symbol(reg, symbol).is_some()) {
+        return Result.Ok(0);
+    }
+    add_answer(reg, ask(r, reflection.Ask.ContainingSymbol(schema.bare(symbol)))?, symbol)?;
+    fetch_missing_deps(r, reg)
+}
+
+fn fetch_missing_deps(r: Reflector, reg: schema.Registry) -> Result<int, string> {
+    while (true) {
+        var missing: [string] = [];
+        for name in reg.file_order {
+            let f = reg.files.get(name).unwrap();
+            for d in f.dependencies {
+                if (!reg.files.contains_key(d) && !missing.contains(d)) {
+                    missing.push(d);
+                }
+            }
+        }
+        if (missing.len() == 0) {
+            return Result.Ok(0);
+        }
+        for d in missing {
+            add_answer(reg, ask(r, reflection.Ask.ByFilename(d))?, d)?;
+        }
+    }
+}

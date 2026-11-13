@@ -1,0 +1,169 @@
+//! Command-line flags in grpcurl's style: `-flag value` or `--flag=value`, repeatable
+//! flags (`-H`, `-proto`, `-import-path`), and boolean switches.
+
+/// Flags that take no value.
+const SWITCHES: [string] = [
+    "plaintext",
+    "insecure",
+    "v",
+    "emit-defaults",
+    "format-error",
+    "proto-names",
+    "include-imports",
+    "no-alpn",
+    "oneshot",
+    "no-reflection",
+    "quiet",
+    "help",
+    "h",
+];
+
+pub struct Args {
+    positional: [string],
+    values: Map<string, [string]>,
+    switches: [string],
+}
+
+pub fn parse(argv: [string]) -> Result<Args, string> {
+    let values: Map<string, [string]> = Map.new();
+    let a = Args { positional: [], values: values, switches: [] };
+    var i = 0;
+    while (i < argv.len()) {
+        let x = argv[i];
+        if (x.starts_with("-") && x.len() > 1 && !is_number(x)) {
+            var name = x.substring(1, x.len());
+            if (name.starts_with("-")) {
+                name = name.substring(1, name.len());
+            }
+            var value = "";
+            var has_value = false;
+            match (name.index_of("=")) {
+                Option.Some(eq) => {
+                    value = name.substring(eq + 1, name.len());
+                    name = name.substring(0, eq);
+                    has_value = true;
+                },
+                Option.None => {},
+            }
+            if (SWITCHES.contains(name)) {
+                if (has_value && value != "true") {
+                    if (value != "false") {
+                        return Result.Err("flag -${name} takes no value");
+                    }
+                } else {
+                    a.switches.push(name);
+                }
+            } else {
+                if (!has_value) {
+                    if (i + 1 >= argv.len()) {
+                        return Result.Err("flag -${name} needs a value");
+                    }
+                    i = i + 1;
+                    value = argv[i];
+                }
+                match (a.values.get(name)) {
+                    Option.Some(list) => list.push(value),
+                    Option.None => a.values.insert(name, [value]),
+                }
+            }
+        } else {
+            a.positional.push(x);
+        }
+        i = i + 1;
+    }
+    Result.Ok(a)
+}
+
+fn is_number(s: string) -> bool {
+    parse_int(s).is_some()
+}
+
+pub fn has(a: Args, name: string) -> bool {
+    a.switches.contains(name)
+}
+
+pub fn value(a: Args, name: string) -> Option<string> {
+    match (a.values.get(name)) {
+        Option.Some(list) => Option.Some(list[list.len() - 1]),
+        Option.None => Option.None,
+    }
+}
+
+pub fn value_or(a: Args, name: string, default: string) -> string {
+    value(a, name).unwrap_or(default)
+}
+
+pub fn values(a: Args, name: string) -> [string] {
+    a.values.get_or(name, [])
+}
+
+pub fn int_value(a: Args, name: string, default: int) -> Result<int, string> {
+    match (value(a, name)) {
+        Option.Some(v) => match (parse_int(v)) {
+            Option.Some(n) => Result.Ok(n),
+            Option.None => Result.Err("-${name}: not an integer: ${v}"),
+        },
+        Option.None => Result.Ok(default),
+    }
+}
+
+/// A duration in seconds (grpcurl's -max-time / -connect-timeout take fractional seconds),
+/// as milliseconds; 0 when absent.
+pub fn seconds_ms(a: Args, name: string) -> Result<int, string> {
+    match (value(a, name)) {
+        Option.Some(v) => match (parse_float(v)) {
+            Option.Some(f) => {
+                if (f < 0.0) {
+                    return Result.Err("-${name}: negative duration");
+                }
+                Result.Ok((f * 1000.0) as int)
+            },
+            Option.None => Result.Err("-${name}: not a number of seconds: ${v}"),
+        },
+        Option.None => Result.Ok(0),
+    }
+}
+
+/// Splits "HOST:PORT" (also "[::1]:PORT").
+pub fn host_port(addr: string) -> Result<(string, int), string> {
+    let i = match (addr.last_index_of(":")) {
+        Option.Some(x) => x,
+        Option.None => return Result.Err("address ${addr} has no port (HOST:PORT)"),
+    };
+    var host = addr.substring(0, i);
+    if (host.starts_with("[") && host.ends_with("]")) {
+        host = host.substring(1, host.len() - 1);
+    }
+    match (parse_int(addr.substring(i + 1, addr.len()))) {
+        Option.Some(p) => {
+            if (p <= 0 || p > 65535) {
+                return Result.Err("port out of range in ${addr}");
+            }
+            Result.Ok((host, p))
+        },
+        Option.None => Result.Err("bad port in ${addr}"),
+    }
+}
+
+/// `-H "name: value"` headers into a metadata map (lower-case names).
+pub fn metadata(a: Args) -> Result<Map<string, string>, string> {
+    let md: Map<string, string> = Map.new();
+    for h in values(a, "H") + values(a, "rpc-header") {
+        match (h.index_of(":")) {
+            Option.Some(i) => {
+                let name = h.substring(0, i).trim().to_lower();
+                let v = h.substring(i + 1, h.len()).trim();
+                if (name == "") {
+                    return Result.Err("-H ${h}: empty header name");
+                }
+                // grpcurl joins repeated headers; gRPC metadata allows that with ", ".
+                match (md.get(name)) {
+                    Option.Some(old) => md.insert(name, "${old}, ${v}"),
+                    Option.None => md.insert(name, v),
+                }
+            },
+            Option.None => return Result.Err("-H ${h}: expected 'name: value'"),
+        }
+    }
+    Result.Ok(md)
+}

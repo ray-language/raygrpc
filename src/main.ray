@@ -1,0 +1,230 @@
+//! raygrpc — a grpcurl-like gRPC toolkit and a demo gRPC server, in raylang.
+
+import bench;
+import cli;
+import client;
+import codec;
+import descriptor;
+import loader;
+import schema;
+import serve;
+import std/fs;
+import std/io;
+import std/json;
+import std/process;
+
+const USAGE: string = `raygrpc — gRPC from the command line (a grpcurl in raylang) and a demo server
+
+Usage:
+  raygrpc call [flags] HOST:PORT pkg.Service/Method   unary call, JSON in (-d) and out
+  raygrpc list [flags] HOST:PORT [SERVICE]            services (or methods) by reflection
+  raygrpc describe [flags] HOST:PORT [SYMBOL...]      a service, method, message or enum
+  raygrpc serve [flags]                               the demo services, with reflection
+  raygrpc bench [flags] HOST:PORT                     calls/s with N concurrent fibers
+  raygrpc encode -proto F TYPE  <json  >bin           JSON → protobuf (like protoc --encode)
+  raygrpc decode -proto F TYPE  <bin   >json          protobuf → JSON
+  raygrpc decode-raw            <bin   >text          schema-less dump (protoc --decode_raw)
+  raygrpc protoset -proto F -o OUT [-include-imports] a FileDescriptorSet, as protoc writes it
+
+Connection flags:
+  -plaintext            h2c (HTTP/2 without TLS)
+  -insecure             TLS without verifying the server certificate (no ALPN)
+  -no-alpn              TLS without ALPN (raylang TLS servers do not negotiate h2)
+  -cacert FILE          trust this CA (re-runs raygrpc with SSL_CERT_FILE=FILE)
+  -client net|raygrpc|oneshot   who carries a unary call: net/grpc_conn (default),
+                        raygrpc's own client (-v, -insecure, -no-alpn) or net/grpc_client
+  -connect-timeout S    seconds to establish the connection
+Call flags:
+  -d JSON | -d @ | -d @FILE   the request (empty = default message)
+  -H 'name: value'      request metadata (repeatable)
+  -max-time S           deadline in seconds (sent as grpc-timeout)
+  -v                    print headers and trailers
+  -emit-defaults        print fields with default values
+  -proto-names          print proto field names instead of lowerCamel
+  -format-error         print a failed status as JSON
+Schema flags (default: server reflection):
+  -proto FILE           a .proto file (repeatable)
+  -import-path DIR      where imports are searched (repeatable)
+  -protoset FILE        a FileDescriptorSet (protoc --descriptor_set_out)
+Serve flags:
+  -host H -port N       listen address (default 127.0.0.1:0, an ephemeral port)
+  -port-file F          write the chosen port to F
+  -tls-cert F -tls-key F    serve TLS (PEM chain and key)
+  -engine raygrpc|net   raygrpc's HTTP/2 server (reflection, metadata) or net/grpc_server
+  -no-reflection        do not register the reflection service
+  -for S                stop after S seconds (default: until SIGINT/SIGTERM)
+  -quiet                no per-connection logs
+Bench flags:
+  -method M -d JSON -c FIBERS -duration S -client net|raygrpc
+`;
+
+fn read_stdin() -> bytes {
+    client.read_stdin_bytes()
+}
+
+fn type_arg(a: cli.Args, cmd: string) -> Result<string, string> {
+    if (a.positional.len() != 1) {
+        return Result.Err("usage: raygrpc ${cmd} -proto FILE [-import-path DIR] TYPE");
+    }
+    Result.Ok(a.positional[0])
+}
+
+fn schema_from_flags(a: cli.Args) -> Result<schema.Registry, string> {
+    if (loader.has_files(a)) {
+        return loader.from_files(a);
+    }
+    // Without -proto/-protoset the demo protos embedded in the binary are the schema.
+    loader.demo_registry()
+}
+
+fn encode_cmd(a: cli.Args) -> Result<int, string> {
+    let t = type_arg(a, "encode")?;
+    let reg = schema_from_flags(a)?;
+    let text = from_utf8(read_stdin())?;
+    let b = codec.from_json(reg, t, text)?;
+    io.write_bytes(b)?;
+    Result.Ok(0)
+}
+
+fn decode_cmd(a: cli.Args) -> Result<int, string> {
+    let t = type_arg(a, "decode")?;
+    let reg = schema_from_flags(a)?;
+    let opts = codec.options();
+    opts.emit_defaults = cli.has(a, "emit-defaults");
+    opts.proto_names = cli.has(a, "proto-names");
+    let doc = codec.to_json(reg, t, read_stdin(), opts)?;
+    print(json.render_doc_pretty(doc, 2));
+    Result.Ok(0)
+}
+
+fn decode_raw_cmd() -> Result<int, string> {
+    let text = codec.decode_raw_text(read_stdin())?;
+    io.write(text)?;
+    Result.Ok(0)
+}
+
+fn protoset_cmd(a: cli.Args) -> Result<int, string> {
+    let out = cli.value_or(a, "o", "");
+    if (out == "") {
+        return Result.Err("usage: raygrpc protoset -proto FILE [-import-path DIR] -o OUT [-include-imports]");
+    }
+    let reg = loader.from_files(a)?;
+    var names: [string] = [];
+    if (cli.has(a, "include-imports")) {
+        names = reg.file_order;
+    } else {
+        // Only the files named on the command line, as protoc does without --include_imports.
+        for p in cli.values(a, "proto") {
+            for n in reg.file_order {
+                if (p == n || p.ends_with("/" + n)) {
+                    if (!names.contains(n)) {
+                        names.push(n);
+                    }
+                }
+            }
+        }
+    }
+    var files: [schema.FileDef] = [];
+    for n in names {
+        files.push(reg.files.get(n).unwrap());
+    }
+    let b = descriptor.encode_set(files);
+    fs.write_file_bytes(out, b)?;
+    Result.Ok(0)
+}
+
+/// -cacert: rustls reads trust anchors from SSL_CERT_FILE, and std/net has no per-call
+/// option, so raygrpc re-runs itself with the variable set.
+fn with_cacert(argv: [string]) -> Option<int> {
+    var ca = "";
+    var rest: [string] = [];
+    var i = 0;
+    while (i < argv.len()) {
+        let x = argv[i];
+        if ((x == "-cacert" || x == "--cacert") && i + 1 < argv.len()) {
+            ca = argv[i + 1];
+            i = i + 2;
+            continue;
+        }
+        if (x.starts_with("-cacert=") || x.starts_with("--cacert=")) {
+            ca = x.substring(x.index_of("=").unwrap() + 1, x.len());
+            i = i + 1;
+            continue;
+        }
+        rest.push(x);
+        i = i + 1;
+    }
+    if (ca == "") {
+        return Option.None;
+    }
+    Option.Some(reexec_with_ca(ca, rest))
+}
+
+fn reexec_with_ca(ca: string, rest: [string]) -> int {
+    let me = process.self_command();
+    let r = process.cmd(me[0], me.slice(1, me.len()) + rest).env("SSL_CERT_FILE", ca).run();
+    match (r) {
+        Result.Ok(out) => {
+            io.write_bytes(out.stdout);
+            eprint_bytes(out.stderr);
+            match (out.exit) {
+                process.Exit.Code(n) => n,
+                process.Exit.Signal(n) => 128 + n,
+            }
+        },
+        Result.Err(e) => {
+            eprint("raygrpc: -cacert: ${e}");
+            1
+        },
+    }
+}
+
+fn eprint_bytes(b: bytes) {
+    if (b.len() > 0) {
+        io.ewrite(from_utf8(b).unwrap_or(""));
+    }
+}
+
+fn dispatch(argv: [string]) -> Result<int, string> {
+    if (argv.len() == 0) {
+        print(USAGE);
+        return Result.Ok(2);
+    }
+    let cmd = argv[0];
+    let a = cli.parse(argv.slice(1, argv.len()))?;
+    if (cli.has(a, "help") || cli.has(a, "h")) {
+        print(USAGE);
+        return Result.Ok(0);
+    }
+    match (cmd) {
+        "call" => client.call(a),
+        "list" => client.list(a),
+        "describe" => client.describe(a),
+        "serve" => serve.run(a),
+        "bench" => bench.run(a),
+        "encode" => encode_cmd(a),
+        "decode" => decode_cmd(a),
+        "decode-raw" => decode_raw_cmd(),
+        "protoset" => protoset_cmd(a),
+        "help" => {
+            print(USAGE);
+            Result.Ok(0)
+        },
+        _ => Result.Err("unknown command '${cmd}' (raygrpc help)"),
+    }
+}
+
+fn main() -> int {
+    let argv = args();
+    match (with_cacert(argv)) {
+        Option.Some(code) => return code,
+        Option.None => {},
+    }
+    match (dispatch(argv)) {
+        Result.Ok(code) => code,
+        Result.Err(e) => {
+            eprint("raygrpc: ${e}");
+            1
+        },
+    }
+}

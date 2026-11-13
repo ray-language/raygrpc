@@ -1,0 +1,397 @@
+//! The demo services of `raygrpc serve` (proto/demo.proto): Greeter, Echo (errors,
+//! deadlines, metadata, the codec round trip) and KeyValue (state in an actor fiber, since
+//! handlers run on copies of what they capture).
+//!
+//! Requests and replies are typed structs with hand-written `wire.Message` codecs; the
+//! `Echo/Roundtrip` method goes through the schema-driven codec instead.
+
+import codec;
+import schema;
+import server;
+import wire;
+from wire import Message;
+import net/grpc_status;
+import std/time;
+
+// ---- messages ----
+
+struct HelloRequest {
+    name: string,
+}
+
+impl wire.Message for HelloRequest {
+    fn encode_to(self, w: wire.Writer) {
+        if (self.name != "") {
+            wire.write_string(w, 1, self.name);
+        }
+    }
+
+    fn merge_field(self, r: wire.Reader, t: wire.Tag) -> Result<bool, string> {
+        if (t.field == 1) {
+            self.name = wire.string_of(r, t)?;
+            return Result.Ok(true);
+        }
+        Result.Ok(false)
+    }
+}
+
+struct HelloReply {
+    message: string,
+}
+
+impl wire.Message for HelloReply {
+    fn encode_to(self, w: wire.Writer) {
+        if (self.message != "") {
+            wire.write_string(w, 1, self.message);
+        }
+    }
+
+    fn merge_field(self, r: wire.Reader, t: wire.Tag) -> Result<bool, string> {
+        if (t.field == 1) {
+            self.message = wire.string_of(r, t)?;
+            return Result.Ok(true);
+        }
+        Result.Ok(false)
+    }
+}
+
+pub struct EchoRequest {
+    message: string,
+    code: int,
+    delay_ms: int,
+    /// The `Everything` payload, kept as raw bytes (echoed untouched, unknown fields too).
+    payload: bytes,
+}
+
+impl wire.Message for EchoRequest {
+    fn encode_to(self, w: wire.Writer) {
+        if (self.message != "") {
+            wire.write_string(w, 1, self.message);
+        }
+        if (self.code != 0) {
+            wire.write_int32(w, 2, self.code);
+        }
+        if (self.delay_ms != 0) {
+            wire.write_int32(w, 3, self.delay_ms);
+        }
+        if (self.payload.len() > 0) {
+            wire.write_bytes(w, 4, self.payload);
+        }
+    }
+
+    fn merge_field(self, r: wire.Reader, t: wire.Tag) -> Result<bool, string> {
+        match (t.field) {
+            1 => self.message = wire.string_of(r, t)?,
+            2 => self.code = wire.to_i32(wire.varint_of(r, t)?),
+            3 => self.delay_ms = wire.to_i32(wire.varint_of(r, t)?),
+            4 => self.payload = wire.bytes_of_field(r, t)?,
+            _ => return Result.Ok(false),
+        }
+        Result.Ok(true)
+    }
+}
+
+pub fn echo_request(message: string) -> EchoRequest {
+    EchoRequest { message: message, code: 0, delay_ms: 0, payload: bytes_of([]) }
+}
+
+pub struct EchoReply {
+    message: string,
+    metadata: Map<string, string>,
+    payload: bytes,
+    deadline_ms: int,
+}
+
+/// A map<string, string> entry.
+struct StringEntry {
+    key: string,
+    value: string,
+}
+
+impl wire.Message for StringEntry {
+    fn encode_to(self, w: wire.Writer) {
+        if (self.key != "") {
+            wire.write_string(w, 1, self.key);
+        }
+        if (self.value != "") {
+            wire.write_string(w, 2, self.value);
+        }
+    }
+
+    fn merge_field(self, r: wire.Reader, t: wire.Tag) -> Result<bool, string> {
+        match (t.field) {
+            1 => self.key = wire.string_of(r, t)?,
+            2 => self.value = wire.string_of(r, t)?,
+            _ => return Result.Ok(false),
+        }
+        Result.Ok(true)
+    }
+}
+
+impl wire.Message for EchoReply {
+    fn encode_to(self, w: wire.Writer) {
+        if (self.message != "") {
+            wire.write_string(w, 1, self.message);
+        }
+        for k in sort(self.metadata.keys()) {
+            wire.write_message(w, 2, StringEntry { key: k, value: self.metadata.get_or(k, "") });
+        }
+        if (self.payload.len() > 0) {
+            wire.write_bytes(w, 3, self.payload);
+        }
+        if (self.deadline_ms != 0) {
+            wire.write_int(w, 4, self.deadline_ms);
+        }
+    }
+
+    fn merge_field(self, r: wire.Reader, t: wire.Tag) -> Result<bool, string> {
+        match (t.field) {
+            1 => self.message = wire.string_of(r, t)?,
+            2 => {
+                let e = wire.decode_into(StringEntry { key: "", value: "" }, wire.bytes_of_field(r, t)?)?;
+                self.metadata.insert(e.key, e.value);
+            },
+            3 => self.payload = wire.bytes_of_field(r, t)?,
+            4 => self.deadline_ms = wire.varint_of(r, t)?,
+            _ => return Result.Ok(false),
+        }
+        Result.Ok(true)
+    }
+}
+
+pub fn empty_echo_reply() -> EchoReply {
+    let md: Map<string, string> = Map.new();
+    EchoReply { message: "", metadata: md, payload: bytes_of([]), deadline_ms: 0 }
+}
+
+/// PutRequest { key = 1; value = 2; } — also KeyRequest { key = 1; } and ListRequest { prefix = 1; }.
+struct KeyValueRequest {
+    key: string,
+    value: bytes,
+}
+
+impl wire.Message for KeyValueRequest {
+    fn encode_to(self, w: wire.Writer) {
+        if (self.key != "") {
+            wire.write_string(w, 1, self.key);
+        }
+        if (self.value.len() > 0) {
+            wire.write_bytes(w, 2, self.value);
+        }
+    }
+
+    fn merge_field(self, r: wire.Reader, t: wire.Tag) -> Result<bool, string> {
+        match (t.field) {
+            1 => self.key = wire.string_of(r, t)?,
+            2 => self.value = wire.bytes_of_field(r, t)?,
+            _ => return Result.Ok(false),
+        }
+        Result.Ok(true)
+    }
+}
+
+fn kv_request(data: bytes) -> Result<KeyValueRequest, grpc_status.Status> {
+    match (wire.decode_into(KeyValueRequest { key: "", value: bytes_of([]) }, data)) {
+        Result.Ok(r) => Result.Ok(r),
+        Result.Err(e) => Result.Err(grpc_status.new(grpc_status.INVALID_ARGUMENT, "bad request: ${e}")),
+    }
+}
+
+// ---- the key/value actor ----
+
+pub enum KvMsg {
+    Put(string, bytes, Channel<bool>),
+    Get(string, Channel<Option<bytes>>),
+    Delete(string, Channel<bool>),
+    List(string, Channel<[string]>),
+}
+
+/// Starts the store fiber; every handler talks to it through the returned channel.
+pub fn start_kv() -> Channel<KvMsg> {
+    let inbox: Channel<KvMsg> = Channel.bounded(256);
+    spawn(fn() {
+        kv_loop(inbox);
+    });
+    inbox
+}
+
+fn kv_loop(inbox: Channel<KvMsg>) {
+    let store: Map<string, bytes> = Map.new();
+    while (true) {
+        match (recv(inbox)) {
+            Option.Some(m) => match (m) {
+                KvMsg.Put(k, v, reply) => {
+                    let created = !store.contains_key(k);
+                    store.insert(k, v);
+                    send(reply, created);
+                },
+                KvMsg.Get(k, reply) => {
+                    let v: Option<bytes> = store.get(k);
+                    send(reply, v);
+                },
+                KvMsg.Delete(k, reply) => {
+                    let existed = store.contains_key(k);
+                    store.remove(k);
+                    send(reply, existed);
+                },
+                KvMsg.List(prefix, reply) => {
+                    var keys: [string] = [];
+                    for k in store.keys() {
+                        if (k.starts_with(prefix)) {
+                            keys.push(k);
+                        }
+                    }
+                    keys = sort(keys);
+                    send(reply, keys);
+                },
+            },
+            Option.None => break,
+        }
+    }
+}
+
+// ---- handlers ----
+
+fn ok_message<M: Message>(m: M) -> Result<server.Answer, grpc_status.Status> {
+    Result.Ok(server.answer(wire.encode(m)))
+}
+
+fn bad(e: string) -> grpc_status.Status {
+    grpc_status.new(grpc_status.INVALID_ARGUMENT, "bad request: ${e}")
+}
+
+fn say_hello(c: server.Call) -> Result<server.Answer, grpc_status.Status> {
+    let req = match (wire.decode_into(HelloRequest { name: "" }, c.message)) {
+        Result.Ok(r) => r,
+        Result.Err(e) => return Result.Err(bad(e)),
+    };
+    if (req.name == "") {
+        return Result.Err(grpc_status.new(grpc_status.INVALID_ARGUMENT, "name is required"));
+    }
+    ok_message(HelloReply { message: "Hello, ${req.name}!" })
+}
+
+fn echo(c: server.Call) -> Result<server.Answer, grpc_status.Status> {
+    let req = match (wire.decode_into(echo_request(""), c.message)) {
+        Result.Ok(r) => r,
+        Result.Err(e) => return Result.Err(bad(e)),
+    };
+    if (req.delay_ms > 0) {
+        if (c.deadline > 0 && time.monotonic() + req.delay_ms > c.deadline) {
+            // Sleep until the deadline, then give up as a real slow server would.
+            let left = c.deadline - time.monotonic();
+            if (left > 0) {
+                time.sleep(left);
+            }
+            return Result.Err(grpc_status.new(grpc_status.DEADLINE_EXCEEDED, "echo: the ${req.delay_ms} ms delay outlives the deadline"));
+        }
+        time.sleep(req.delay_ms);
+    }
+    if (req.code != 0) {
+        if (req.code < 0 || req.code > 16) {
+            return Result.Err(grpc_status.new(grpc_status.INVALID_ARGUMENT, "code ${req.code} is not a gRPC status"));
+        }
+        return Result.Err(grpc_status.new(req.code, if (req.message != "") { req.message } else { grpc_status.code_name(req.code) }));
+    }
+    let md: Map<string, string> = Map.new();
+    for (k, v) in c.metadata {
+        if (k != "content-type" && k != "te" && k != "user-agent" && k != "grpc-timeout" && k != "grpc-accept-encoding") {
+            md.insert(k, v);
+        }
+    }
+    let left = if (c.deadline > 0) { c.deadline - time.monotonic() } else { 0 };
+    let reply = EchoReply { message: req.message, metadata: md, payload: req.payload, deadline_ms: left };
+    let a = server.answer(wire.encode(reply));
+    a.headers.insert("x-raygrpc-server", "0.1");
+    // Metadata named echo-* comes back as trailers.
+    for (k, v) in c.metadata {
+        if (k.starts_with("echo-")) {
+            a.trailers.insert(k, v);
+        }
+    }
+    Result.Ok(a)
+}
+
+fn roundtrip(c: server.Call, reg: schema.Registry) -> Result<server.Answer, grpc_status.Status> {
+    let doc = match (codec.to_json(reg, "raygrpc.demo.Everything", c.message, codec.options())) {
+        Result.Ok(d) => d,
+        Result.Err(e) => return Result.Err(bad(e)),
+    };
+    let m = schema.message(reg, "raygrpc.demo.Everything").unwrap();
+    match (codec.encode_message(reg, m, doc, 0)) {
+        Result.Ok(b) => Result.Ok(server.answer(b)),
+        Result.Err(e) => Result.Err(grpc_status.new(grpc_status.INTERNAL, "re-encoding: ${e}")),
+    }
+}
+
+fn kv_put(c: server.Call, kv: Channel<KvMsg>) -> Result<server.Answer, grpc_status.Status> {
+    let req = kv_request(c.message)?;
+    if (req.key == "") {
+        return Result.Err(grpc_status.new(grpc_status.INVALID_ARGUMENT, "key is required"));
+    }
+    let reply: Channel<bool> = Channel.bounded(1);
+    send(kv, KvMsg.Put(req.key, req.value, reply));
+    let created = recv(reply).unwrap_or(false);
+    let w = wire.writer();
+    if (created) {
+        wire.write_bool(w, 1, true);
+    }
+    Result.Ok(server.answer(wire.finish(w)))
+}
+
+fn kv_get(c: server.Call, kv: Channel<KvMsg>) -> Result<server.Answer, grpc_status.Status> {
+    let req = kv_request(c.message)?;
+    let reply: Channel<Option<bytes>> = Channel.bounded(1);
+    send(kv, KvMsg.Get(req.key, reply));
+    match (recv(reply)) {
+        Option.Some(found) => match (found) {
+            Option.Some(v) => {
+                let w = wire.writer();
+                if (v.len() > 0) {
+                    wire.write_bytes(w, 1, v);
+                }
+                Result.Ok(server.answer(wire.finish(w)))
+            },
+            Option.None => Result.Err(grpc_status.new(grpc_status.NOT_FOUND, "key not found: ${req.key}")),
+        },
+        Option.None => Result.Err(grpc_status.new(grpc_status.UNAVAILABLE, "store stopped")),
+    }
+}
+
+fn kv_delete(c: server.Call, kv: Channel<KvMsg>) -> Result<server.Answer, grpc_status.Status> {
+    let req = kv_request(c.message)?;
+    let reply: Channel<bool> = Channel.bounded(1);
+    send(kv, KvMsg.Delete(req.key, reply));
+    if (!recv(reply).unwrap_or(false)) {
+        return Result.Err(grpc_status.new(grpc_status.NOT_FOUND, "key not found: ${req.key}"));
+    }
+    let w = wire.writer();
+    wire.write_bool(w, 1, true);
+    Result.Ok(server.answer(wire.finish(w)))
+}
+
+fn kv_list(c: server.Call, kv: Channel<KvMsg>) -> Result<server.Answer, grpc_status.Status> {
+    let req = kv_request(c.message)?;
+    let reply: Channel<[string]> = Channel.bounded(1);
+    send(kv, KvMsg.List(req.key, reply));
+    let keys = recv(reply).unwrap_or([]);
+    let w = wire.writer();
+    for k in keys {
+        wire.write_string(w, 1, k);
+    }
+    Result.Ok(server.answer(wire.finish(w)))
+}
+
+/// Routes one call of the demo services.
+pub fn handle(c: server.Call, kv: Channel<KvMsg>, reg: schema.Registry) -> Result<server.Answer, grpc_status.Status> {
+    match (c.path) {
+        "/raygrpc.demo.Greeter/SayHello" => say_hello(c),
+        "/raygrpc.demo.Echo/Echo" => echo(c),
+        "/raygrpc.demo.Echo/Roundtrip" => roundtrip(c, reg),
+        "/raygrpc.demo.KeyValue/Put" => kv_put(c, kv),
+        "/raygrpc.demo.KeyValue/Get" => kv_get(c, kv),
+        "/raygrpc.demo.KeyValue/Delete" => kv_delete(c, kv),
+        "/raygrpc.demo.KeyValue/List" => kv_list(c, kv),
+        p => Result.Err(grpc_status.new(grpc_status.UNIMPLEMENTED, "unknown method ${p}")),
+    }
+}

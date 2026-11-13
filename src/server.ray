@@ -1,0 +1,351 @@
+//! raygrpc's own gRPC server, on net's HTTP/2 building blocks (`net/grpc_h2`: frames,
+//! HPACK, flow control) instead of `net/grpc_server`, for two things that server cannot do:
+//! streaming calls (server reflection is a bidirectional stream) and response metadata
+//! (custom headers and trailers). Unary handlers still speak `net/grpc_status.Status`.
+//!
+//! One fiber per connection; the calls of one connection run in arrival order.
+
+import net/grpc_h2 as h2;
+import net/grpc_server;
+import net/grpc_status;
+import net/hpack;
+import net/http2;
+import std/net;
+import std/protobuf;
+import std/time;
+import reflection;
+
+/// A unary call as handlers see it (the same fields as `grpc_server.Call`).
+pub type Call = grpc_server.Call;
+
+/// A handler's success: the response message plus optional response metadata.
+pub struct Answer {
+    message: bytes,
+    headers: Map<string, string>,
+    trailers: Map<string, string>,
+}
+
+pub fn answer(message: bytes) -> Answer {
+    let headers: Map<string, string> = Map.new();
+    let trailers: Map<string, string> = Map.new();
+    Answer { message: message, headers: headers, trailers: trailers }
+}
+
+pub struct Config {
+    tls_cert: string,
+    tls_key: string,
+    reflection: bool,
+    index: reflection.Index,
+    max_message: int,
+    quiet: bool,
+}
+
+/// Per-stream state while its request arrives.
+struct Pending {
+    path: string,
+    metadata: Map<string, string>,
+    deadline: int,
+    buf: [bytes],
+    streaming: bool,
+    replied_headers: bool,
+}
+
+const PREFACE_LEN: int = 24;
+
+fn log(cfg: Config, msg: string) {
+    if (!cfg.quiet) {
+        eprint("raygrpc serve: ${msg}");
+    }
+}
+
+/// Accepts connections until `stop` closes (or forever); each gets its own fiber.
+pub fn serve(listener: int, cfg: Config, stop: Channel<int>, handler: fn(Call) -> Result<Answer, grpc_status.Status>) -> Result<int, string> {
+    let conns: Channel<int> = Channel.bounded(64);
+    spawn(fn() {
+        while (true) {
+            match (net.tcp_accept(listener)) {
+                Result.Ok(h) => send(conns, h),
+                Result.Err(e) => {
+                    eprint("raygrpc serve: accept: ${e}");
+                    close(conns);
+                    break;
+                },
+            }
+        }
+    });
+    while (true) {
+        match (select([conns, stop])) {
+            0 => match (recv(conns)) {
+                Option.Some(h) => {
+                    spawn(fn() {
+                        serve_handle(h, cfg, handler);
+                    });
+                },
+                Option.None => return Result.Err("listener closed"),
+            },
+            _ => return Result.Ok(0),
+        }
+    }
+}
+
+fn serve_handle(h: int, cfg: Config, handler: fn(Call) -> Result<Answer, grpc_status.Status>) {
+    net.set_nodelay(h, true);
+    var conn = h;
+    if (cfg.tls_cert != "") {
+        match (net.tls_accept(h, cfg.tls_cert, cfg.tls_key)) {
+            Result.Ok(t) => conn = t,
+            Result.Err(e) => {
+                log(cfg, "TLS handshake: ${e}");
+                close(h);
+                return;
+            },
+        }
+    }
+    match (serve_conn(conn, cfg, handler)) {
+        Result.Ok(_) => {},
+        Result.Err(e) => {
+            if (e != "eof" && e != "connection closed") {
+                log(cfg, "connection: ${e}");
+            }
+        },
+    }
+    close(conn);
+}
+
+fn header_map(hs: [hpack.HEntry]) -> Map<string, string> {
+    let m: Map<string, string> = Map.new();
+    for e in hs {
+        if (!e.name.starts_with(":")) {
+            match (m.get(e.name)) {
+                Option.Some(old) => m.insert(e.name, "${old}, ${e.value}"),
+                Option.None => m.insert(e.name, e.value),
+            }
+        }
+    }
+    m
+}
+
+/// Serves one HTTP/2 connection (already TLS-wrapped if needed).
+pub fn serve_conn(conn: int, cfg: Config, handler: fn(Call) -> Result<Answer, grpc_status.Status>) -> Result<int, string> {
+    let link = h2.new_link(conn);
+    let pre = h2.read_exact(link, PREFACE_LEN)?;
+    if (pre != http2.preface()) {
+        return Result.Err("not an HTTP/2 client preface (is the client using TLS against a plaintext port, or vice versa?)");
+    }
+    h2.write(link, http2.settings_empty())?;
+    let streams: Map<int, Pending> = Map.new();
+    // Frames that arrive while send_data waits for window: handled after it returns.
+    var backlog: [h2.Frame] = [];
+    var last_stream = 0;
+    while (true) {
+        let fr = if (backlog.len() > 0) {
+            backlog.remove_at(0)
+        } else {
+            match (h2.read_frame(link)) {
+                Result.Ok(f) => f,
+                Result.Err(e) => return Result.Err(e),
+            }
+        };
+        if (h2.control(link, fr)?) {
+            if (link.goaway) {
+                return Result.Ok(0);
+            }
+            continue;
+        }
+        let id = fr.stream_id;
+        if (fr.ftype == h2.HEADERS) {
+            let hs = h2.decode_headers(link, fr.payload)?;
+            if (streams.contains_key(id)) {
+                // Client trailers (rare in gRPC): treat as end of stream.
+                if ((fr.flags & h2.END_STREAM) != 0) {
+                    finish(link, cfg, streams, id, handler, backlog)?;
+                }
+                continue;
+            }
+            if (id <= last_stream || id % 2 == 0) {
+                h2.send_goaway(link, last_stream, h2.PROTOCOL_ERROR)?;
+                return Result.Err("bad stream id ${id}");
+            }
+            last_stream = id;
+            let path = h2.find(hs, ":path");
+            let md = header_map(hs);
+            var deadline = 0;
+            let tv = h2.find(hs, "grpc-timeout");
+            if (tv != "") {
+                let ms = grpc_server.parse_timeout(tv);
+                if (ms >= 0) {
+                    deadline = time.monotonic() + ms;
+                }
+            }
+            h2.open_stream(link, id);
+            let streaming = cfg.reflection && (path == reflection.PATH_V1 || path == reflection.PATH_V1ALPHA);
+            streams.insert(id, Pending { path: path, metadata: md, deadline: deadline, buf: [], streaming: streaming, replied_headers: false });
+            if (h2.find(hs, ":method") != "POST") {
+                reply_error(link, streams, id, grpc_status.new(grpc_status.UNIMPLEMENTED, "gRPC requires POST"), backlog)?;
+                continue;
+            }
+            if ((fr.flags & h2.END_STREAM) != 0) {
+                finish(link, cfg, streams, id, handler, backlog)?;
+            }
+        } else if (fr.ftype == h2.DATA) {
+            let known = streams.contains_key(id);
+            h2.release(link, fr, known)?;
+            if (!known) {
+                continue;
+            }
+            let st = streams.get(id).unwrap();
+            st.buf.push(fr.payload);
+            if (st.streaming) {
+                stream_messages(link, cfg, st, id, backlog)?;
+            } else {
+                var size = 0;
+                for b in st.buf {
+                    size = size + b.len();
+                }
+                if (size > cfg.max_message + 5) {
+                    reply_error(link, streams, id, grpc_status.new(grpc_status.RESOURCE_EXHAUSTED, "request larger than ${cfg.max_message} octets"), backlog)?;
+                    continue;
+                }
+            }
+            if ((fr.flags & h2.END_STREAM) != 0) {
+                finish(link, cfg, streams, id, handler, backlog)?;
+            }
+        } else if (fr.ftype == h2.RST_STREAM) {
+            streams.remove(id);
+            h2.close_stream(link, id);
+        }
+    }
+}
+
+fn response_headers(extra: Map<string, string>) -> [hpack.HEntry] {
+    var hs = [h2.hdr(":status", "200"), h2.hdr("content-type", "application/grpc")];
+    for (k, v) in extra {
+        hs.push(h2.hdr(k, v));
+    }
+    hs
+}
+
+fn trailers(st: grpc_status.Status, extra: Map<string, string>) -> [hpack.HEntry] {
+    var hs = [h2.hdr("grpc-status", "${st.code}")];
+    if (st.message != "") {
+        hs.push(h2.hdr("grpc-message", grpc_status.percent_encode(st.message)));
+    }
+    for (k, v) in extra {
+        hs.push(h2.hdr(k, v));
+    }
+    hs
+}
+
+/// Sends `payload` on the stream; frames read meanwhile go to the backlog.
+fn send_message(link: h2.Link, id: int, payload: bytes, backlog: [h2.Frame]) -> Result<bool, string> {
+    h2.send_data(link, id, protobuf.grpc_frame(payload), false, fn(f: h2.Frame) -> Result<int, string> {
+        backlog.push(f);
+        Result.Ok(0)
+    })
+}
+
+fn reply_error(link: h2.Link, streams: Map<int, Pending>, id: int, st: grpc_status.Status, backlog: [h2.Frame]) -> Result<int, string> {
+    let p = streams.get(id).unwrap();
+    let none: Map<string, string> = Map.new();
+    if (p.replied_headers) {
+        h2.send_headers(link, id, trailers(st, none), true)?;
+    } else {
+        // Trailers-only response: one HEADERS frame with the status.
+        h2.send_headers(link, id, [h2.hdr(":status", "200"), h2.hdr("content-type", "application/grpc")] + trailers(st, none), true)?;
+    }
+    streams.remove(id);
+    h2.close_stream(link, id);
+    Result.Ok(0)
+}
+
+/// The complete gRPC messages buffered so far; the incomplete tail stays in `buf`.
+fn take_messages(st: Pending) -> Result<[bytes], string> {
+    let all = bytes_concat(st.buf);
+    var out: [bytes] = [];
+    var pos = 0;
+    while (all.len() - pos >= 5) {
+        if (all[pos] != 0) {
+            return Result.Err("compressed messages are not supported");
+        }
+        let n = (all[pos + 1] << 24) | (all[pos + 2] << 16) | (all[pos + 3] << 8) | all[pos + 4];
+        if (all.len() - pos - 5 < n) {
+            break;
+        }
+        out.push(all.sub_bytes(pos + 5, pos + 5 + n));
+        pos = pos + 5 + n;
+    }
+    st.buf = if (pos < all.len()) { [all.sub_bytes(pos, all.len())] } else { [] };
+    Result.Ok(out)
+}
+
+/// A streaming (reflection) call answers each request message as soon as it is complete.
+fn stream_messages(link: h2.Link, cfg: Config, st: Pending, id: int, backlog: [h2.Frame]) -> Result<int, string> {
+    let msgs = take_messages(st)?;
+    for m in msgs {
+        if (!st.replied_headers) {
+            let none: Map<string, string> = Map.new();
+            h2.send_headers(link, id, response_headers(none), false)?;
+            st.replied_headers = true;
+        }
+        let reply = match (reflection.answer_bytes(cfg.index, m)) {
+            Result.Ok(b) => b,
+            Result.Err(e) => return Result.Err("reflection: ${e}"),
+        };
+        send_message(link, id, reply, backlog)?;
+    }
+    Result.Ok(0)
+}
+
+fn finish(link: h2.Link, cfg: Config, streams: Map<int, Pending>, id: int, handler: fn(Call) -> Result<Answer, grpc_status.Status>, backlog: [h2.Frame]) -> Result<int, string> {
+    let st = streams.get(id).unwrap();
+    let none: Map<string, string> = Map.new();
+    if (st.streaming) {
+        stream_messages(link, cfg, st, id, backlog)?;
+        if (!st.replied_headers) {
+            h2.send_headers(link, id, response_headers(none), false)?;
+        }
+        h2.send_headers(link, id, trailers(grpc_status.new(grpc_status.OK, ""), none), true)?;
+        streams.remove(id);
+        h2.close_stream(link, id);
+        return Result.Ok(0);
+    }
+    let msgs = match (take_messages(st)) {
+        Result.Ok(m) => m,
+        Result.Err(e) => return reply_error(link, streams, id, grpc_status.new(grpc_status.UNIMPLEMENTED, e), backlog),
+    };
+    if (msgs.len() != 1 || st.buf.len() > 0) {
+        return reply_error(link, streams, id, grpc_status.new(grpc_status.INTERNAL, "a unary call needs exactly one request message, got ${msgs.len()}"), backlog);
+    }
+    if (st.deadline > 0 && time.monotonic() >= st.deadline) {
+        return reply_error(link, streams, id, grpc_status.new(grpc_status.DEADLINE_EXCEEDED, "deadline exceeded before the call started"), backlog);
+    }
+    let call = grpc_server.Call { path: st.path, message: msgs[0], metadata: st.metadata, deadline: st.deadline };
+    let outcome = if (cfg.reflection && (st.path == reflection.PATH_V1 || st.path == reflection.PATH_V1ALPHA)) {
+        match (reflection.answer_bytes(cfg.index, msgs[0])) {
+            Result.Ok(b) => Result.Ok(answer(b)),
+            Result.Err(e) => Result.Err(grpc_status.new(grpc_status.INVALID_ARGUMENT, e)),
+        }
+    } else {
+        handler(call)
+    };
+    if (st.deadline > 0 && time.monotonic() > st.deadline) {
+        return reply_error(link, streams, id, grpc_status.new(grpc_status.DEADLINE_EXCEEDED, "deadline exceeded"), backlog);
+    }
+    match (outcome) {
+        Result.Ok(a) => {
+            if (a.message.len() > cfg.max_message) {
+                return reply_error(link, streams, id, grpc_status.new(grpc_status.RESOURCE_EXHAUSTED, "response larger than ${cfg.max_message} octets"), backlog);
+            }
+            h2.send_headers(link, id, response_headers(a.headers), false)?;
+            st.replied_headers = true;
+            let sent = send_message(link, id, a.message, backlog)?;
+            if (sent) {
+                h2.send_headers(link, id, trailers(grpc_status.new(grpc_status.OK, ""), a.trailers), true)?;
+            }
+            streams.remove(id);
+            h2.close_stream(link, id);
+            Result.Ok(0)
+        },
+        Result.Err(s) => reply_error(link, streams, id, s, backlog),
+    }
+}

@@ -1,0 +1,318 @@
+//! gRPC server reflection (grpc.reflection.v1 and v1alpha, same messages): the typed
+//! request/response messages, the server-side index that answers them, and the helpers the
+//! client uses to rebuild a schema from the answers.
+
+import descriptor;
+import schema;
+import wire;
+
+pub const PATH_V1: string = "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo";
+pub const PATH_V1ALPHA: string = "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo";
+pub const SERVICE_V1: string = "grpc.reflection.v1.ServerReflection";
+pub const SERVICE_V1ALPHA: string = "grpc.reflection.v1alpha.ServerReflection";
+
+pub enum Ask {
+    Nothing,
+    ByFilename(string),
+    ContainingSymbol(string),
+    ContainingExtension(string, int),
+    ExtensionNumbers(string),
+    ListServices(string),
+}
+
+pub struct Request {
+    host: string,
+    ask: Ask,
+}
+
+pub enum Answer {
+    Nothing,
+    Files([bytes]),
+    ExtensionNumbers(string, [int]),
+    Services([string]),
+    Error(int, string),
+}
+
+pub struct Response {
+    valid_host: string,
+    original: Request,
+    answer: Answer,
+}
+
+pub fn request(ask: Ask) -> Request {
+    Request { host: "", ask: ask }
+}
+
+fn empty_request() -> Request {
+    Request { host: "", ask: Ask.Nothing }
+}
+
+pub fn empty_response() -> Response {
+    Response { valid_host: "", original: empty_request(), answer: Answer.Nothing }
+}
+
+/// ExtensionRequest { containing_type = 1; extension_number = 2; }
+struct ExtensionRequest {
+    containing_type: string,
+    number: int,
+}
+
+impl wire.Message for ExtensionRequest {
+    fn encode_to(self, w: wire.Writer) {
+        if (self.containing_type != "") {
+            wire.write_string(w, 1, self.containing_type);
+        }
+        if (self.number != 0) {
+            wire.write_int32(w, 2, self.number);
+        }
+    }
+
+    fn merge_field(self, r: wire.Reader, t: wire.Tag) -> Result<bool, string> {
+        match (t.field) {
+            1 => self.containing_type = wire.string_of(r, t)?,
+            2 => self.number = wire.to_i32(wire.varint_of(r, t)?),
+            _ => return Result.Ok(false),
+        }
+        Result.Ok(true)
+    }
+}
+
+impl wire.Message for Request {
+    fn encode_to(self, w: wire.Writer) {
+        if (self.host != "") {
+            wire.write_string(w, 1, self.host);
+        }
+        match (self.ask) {
+            Ask.Nothing => {},
+            Ask.ByFilename(s) => wire.write_string(w, 3, s),
+            Ask.ContainingSymbol(s) => wire.write_string(w, 4, s),
+            Ask.ContainingExtension(t, n) => wire.write_message(w, 5, ExtensionRequest { containing_type: t, number: n }),
+            Ask.ExtensionNumbers(s) => wire.write_string(w, 6, s),
+            Ask.ListServices(s) => wire.write_string(w, 7, s),
+        }
+    }
+
+    fn merge_field(self, r: wire.Reader, t: wire.Tag) -> Result<bool, string> {
+        match (t.field) {
+            1 => self.host = wire.string_of(r, t)?,
+            3 => self.ask = Ask.ByFilename(wire.string_of(r, t)?),
+            4 => self.ask = Ask.ContainingSymbol(wire.string_of(r, t)?),
+            5 => {
+                let e = wire.decode_into(ExtensionRequest { containing_type: "", number: 0 }, wire.bytes_of_field(r, t)?)?;
+                self.ask = Ask.ContainingExtension(e.containing_type, e.number);
+            },
+            6 => self.ask = Ask.ExtensionNumbers(wire.string_of(r, t)?),
+            7 => self.ask = Ask.ListServices(wire.string_of(r, t)?),
+            _ => return Result.Ok(false),
+        }
+        Result.Ok(true)
+    }
+}
+
+fn encode_answer(a: Answer) -> (int, bytes) {
+    let w = wire.writer();
+    match (a) {
+        Answer.Nothing => return (0, bytes_of([])),
+        Answer.Files(fs) => {
+            for f in fs {
+                wire.write_bytes(w, 1, f);
+            }
+            (4, wire.finish(w))
+        },
+        Answer.ExtensionNumbers(base, ns) => {
+            wire.write_string(w, 1, base);
+            if (ns.len() > 0) {
+                wire.write_packed_varints(w, 2, ns);
+            }
+            (5, wire.finish(w))
+        },
+        Answer.Services(names) => {
+            for n in names {
+                let sw = wire.writer();
+                wire.write_string(sw, 1, n);
+                wire.write_bytes(w, 1, wire.finish(sw));
+            }
+            (6, wire.finish(w))
+        },
+        Answer.Error(code, msg) => {
+            wire.write_int32(w, 1, code);
+            wire.write_string(w, 2, msg);
+            (7, wire.finish(w))
+        },
+    }
+}
+
+fn decode_answer(field: int, b: bytes) -> Result<Answer, string> {
+    let raw = wire.parse_raw(b)?;
+    match (field) {
+        4 => {
+            var files: [bytes] = [];
+            for f in raw {
+                match (f.value) {
+                    wire.Raw.Bytes(x) => files.push(x),
+                    _ => {},
+                }
+            }
+            Result.Ok(Answer.Files(files))
+        },
+        5 => {
+            var base = "";
+            var ns: [int] = [];
+            for f in raw {
+                match (f.value) {
+                    wire.Raw.Bytes(x) => {
+                        if (f.field == 1) {
+                            base = from_utf8(x).unwrap_or("");
+                        } else {
+                            ns = ns + wire.unpack_varints(x)?;
+                        }
+                    },
+                    wire.Raw.Varint(n) => ns.push(n),
+                    _ => {},
+                }
+            }
+            Result.Ok(Answer.ExtensionNumbers(base, ns))
+        },
+        6 => {
+            var names: [string] = [];
+            for f in raw {
+                match (f.value) {
+                    wire.Raw.Bytes(x) => {
+                        for g in wire.parse_raw(x)? {
+                            match (g.value) {
+                                wire.Raw.Bytes(n) => names.push(from_utf8(n).unwrap_or("")),
+                                _ => {},
+                            }
+                        }
+                    },
+                    _ => {},
+                }
+            }
+            Result.Ok(Answer.Services(names))
+        },
+        7 => {
+            var code = 0;
+            var msg = "";
+            for f in raw {
+                match (f.value) {
+                    wire.Raw.Varint(n) => code = wire.to_i32(n),
+                    wire.Raw.Bytes(x) => msg = from_utf8(x).unwrap_or(""),
+                    _ => {},
+                }
+            }
+            Result.Ok(Answer.Error(code, msg))
+        },
+        _ => Result.Ok(Answer.Nothing),
+    }
+}
+
+impl wire.Message for Response {
+    fn encode_to(self, w: wire.Writer) {
+        if (self.valid_host != "") {
+            wire.write_string(w, 1, self.valid_host);
+        }
+        wire.write_message(w, 2, self.original);
+        let (field, body) = encode_answer(self.answer);
+        if (field != 0) {
+            wire.write_bytes(w, field, body);
+        }
+    }
+
+    fn merge_field(self, r: wire.Reader, t: wire.Tag) -> Result<bool, string> {
+        match (t.field) {
+            1 => self.valid_host = wire.string_of(r, t)?,
+            2 => self.original = wire.decode_into(empty_request(), wire.bytes_of_field(r, t)?)?,
+            4 => self.answer = decode_answer(4, wire.bytes_of_field(r, t)?)?,
+            5 => self.answer = decode_answer(5, wire.bytes_of_field(r, t)?)?,
+            6 => self.answer = decode_answer(6, wire.bytes_of_field(r, t)?)?,
+            7 => self.answer = decode_answer(7, wire.bytes_of_field(r, t)?)?,
+            _ => return Result.Ok(false),
+        }
+        Result.Ok(true)
+    }
+}
+
+// ---- server side ----
+
+/// What a reflection server knows: every file's descriptor bytes, its dependencies and the
+/// file that declares each symbol. Plain data, so it can be copied into connection fibers.
+pub struct Index {
+    files: Map<string, bytes>,
+    deps: Map<string, [string]>,
+    symbols: Map<string, string>,
+    services: [string],
+}
+
+pub fn index_of(reg: schema.Registry) -> Index {
+    let files: Map<string, bytes> = Map.new();
+    let deps: Map<string, [string]> = Map.new();
+    for name in reg.file_order {
+        let f = reg.files.get(name).unwrap();
+        files.insert(name, descriptor.encode_file(f));
+        deps.insert(name, f.dependencies);
+    }
+    let symbols: Map<string, string> = Map.new();
+    for (k, v) in reg.symbol_file {
+        symbols.insert(k, v);
+    }
+    Index { files: files, deps: deps, symbols: symbols, services: schema.service_names(reg) }
+}
+
+/// The file and its transitive dependencies, dependencies first.
+fn closure(ix: Index, file: string) -> [bytes] {
+    var order: [string] = [];
+    closure_into(ix, file, order);
+    var out: [bytes] = [];
+    for n in order {
+        out.push(ix.files.get(n).unwrap());
+    }
+    out
+}
+
+fn closure_into(ix: Index, file: string, order: [string]) {
+    if (order.contains(file) || !ix.files.contains_key(file)) {
+        return;
+    }
+    for d in ix.deps.get_or(file, []) {
+        closure_into(ix, d, order);
+    }
+    order.push(file);
+}
+
+/// gRPC status codes used in error responses.
+const NOT_FOUND: int = 5;
+const UNIMPLEMENTED: int = 12;
+const INVALID_ARGUMENT: int = 3;
+
+pub fn answer(ix: Index, req: Request) -> Response {
+    let a = match (req.ask) {
+        Ask.ListServices(_) => Answer.Services(ix.services),
+        Ask.ByFilename(name) => {
+            if (ix.files.contains_key(name)) {
+                Answer.Files(closure(ix, name))
+            } else {
+                Answer.Error(NOT_FOUND, "file not found: ${name}")
+            }
+        },
+        Ask.ContainingSymbol(sym) => match (ix.symbols.get(schema.bare(sym))) {
+            Option.Some(file) => Answer.Files(closure(ix, file)),
+            Option.None => Answer.Error(NOT_FOUND, "symbol not found: ${sym}"),
+        },
+        Ask.ContainingExtension(t, n) => Answer.Error(NOT_FOUND, "extension not found: ${t}(${n})"),
+        Ask.ExtensionNumbers(t) => {
+            if (ix.symbols.contains_key(schema.bare(t))) {
+                Answer.ExtensionNumbers(schema.bare(t), [])
+            } else {
+                Answer.Error(NOT_FOUND, "type not found: ${t}")
+            }
+        },
+        Ask.Nothing => Answer.Error(INVALID_ARGUMENT, "empty reflection request"),
+    };
+    Response { valid_host: req.host, original: req, answer: a }
+}
+
+/// Decodes one request message and encodes the answer.
+pub fn answer_bytes(ix: Index, msg: bytes) -> Result<bytes, string> {
+    let req = wire.decode_into(empty_request(), msg)?;
+    Result.Ok(wire.encode(answer(ix, req)))
+}

@@ -1,0 +1,192 @@
+// End to end, in one process: raygrpc's server and net/grpc_server on ephemeral ports, called
+// through net/grpc_conn and raygrpc's own client, reflection included; then TLS with a
+// throwaway CA made by scripts/certs.sh (skipped when openssl is missing).
+//
+// One @test on purpose: `ray test` keeps OS listeners alive between tests.
+
+import demo;
+import h2client;
+import loader;
+import reflection;
+import schema;
+import server;
+import codec;
+import wire;
+import net/grpc_conn;
+import net/grpc_server;
+import net/grpc_status;
+import std/fs;
+import std/json;
+import std/net;
+import std/process;
+import std/time;
+
+fn start_raygrpc(cert: string, key: string, stop: Channel<int>) -> int {
+    let reg = loader.demo_registry().unwrap();
+    let kv = demo.start_kv();
+    let l = net.tcp_listen("127.0.0.1", 0).unwrap();
+    let port = net.local_port(l);
+    let cfg = server.Config {
+        tls_cert: cert,
+        tls_key: key,
+        reflection: true,
+        index: reflection.index_of(reg),
+        max_message: 65536,
+        quiet: true,
+    };
+    spawn(fn() {
+        server.serve(l, cfg, stop, fn(c: server.Call) -> Result<server.Answer, grpc_status.Status> {
+            demo.handle(c, kv, reg)
+        });
+    });
+    port
+}
+
+fn start_net(stop: Channel<int>) -> int {
+    let reg = loader.demo_registry().unwrap();
+    let kv = demo.start_kv();
+    let l = grpc_server.bind("127.0.0.1", 0).unwrap();
+    spawn(fn() {
+        grpc_server.serve_router_until(l, stop, grpc_server.default_options(), fn() -> grpc_server.Router {
+            grpc_server.router().fallback(fn(c: grpc_server.Call) -> Result<bytes, grpc_status.Status> {
+                match (demo.handle(c, kv, reg)) {
+                    Result.Ok(a) => Result.Ok(a.message),
+                    Result.Err(s) => Result.Err(s),
+                }
+            })
+        });
+    });
+    l.port
+}
+
+fn hello(name: string) -> bytes {
+    let w = wire.writer();
+    wire.write_string(w, 1, name);
+    wire.finish(w)
+}
+
+fn no_md() -> Map<string, string> {
+    let m: Map<string, string> = Map.new();
+    m
+}
+
+fn json_of(reg: schema.Registry, t: string, b: bytes) -> string {
+    json.render_doc(codec.to_json(reg, t, b, codec.options()).unwrap())
+}
+
+fn check_server(port: int, reg: schema.Registry, own_server: bool) {
+    // net/grpc_conn: unary calls on one persistent connection.
+    let c = grpc_conn.connect("127.0.0.1", port).unwrap();
+    let r = grpc_conn.call(c, "/raygrpc.demo.Greeter/SayHello", hello("conn"), no_md(), 2000).unwrap();
+    assert_eq(r.status, 0);
+    assert_eq(json_of(reg, "raygrpc.demo.HelloReply", r.message), "{\"message\":\"Hello, conn!\"}");
+    let e = grpc_conn.call(c, "/raygrpc.demo.Greeter/SayHello", hello(""), no_md(), 2000).unwrap();
+    assert_eq(e.status, grpc_status.INVALID_ARGUMENT);
+    assert_eq(e.status_message, "name is required");
+    // Status messages are percent-encoded on the wire and decoded back.
+    let req = codec.from_json(reg, "raygrpc.demo.EchoRequest", `{"code": 5, "message": "ñandú 100%"}`).unwrap();
+    let nf = grpc_conn.call(c, "/raygrpc.demo.Echo/Echo", req, no_md(), 2000).unwrap();
+    assert_eq(nf.status, 5);
+    assert_eq(nf.status_message, "ñandú 100%");
+    let un = grpc_conn.call(c, "/raygrpc.demo.Nope/Nope", hello("x"), no_md(), 2000).unwrap();
+    assert_eq(un.status, grpc_status.UNIMPLEMENTED);
+    // Malformed request bytes: INVALID_ARGUMENT, and the connection survives.
+    let junk = grpc_conn.call(c, "/raygrpc.demo.Greeter/SayHello", bytes_of([0x0A, 0x09]), no_md(), 2000).unwrap();
+    assert_eq(junk.status, grpc_status.INVALID_ARGUMENT);
+    // The KeyValue actor keeps state across calls (handlers run on copies).
+    let put = codec.from_json(reg, "raygrpc.demo.PutRequest", `{"key": "k1", "value": "aGVsbG8="}`).unwrap();
+    let p1 = grpc_conn.call(c, "/raygrpc.demo.KeyValue/Put", put, no_md(), 2000).unwrap();
+    assert_eq(json_of(reg, "raygrpc.demo.PutReply", p1.message), "{\"created\":true}");
+    let key = codec.from_json(reg, "raygrpc.demo.KeyRequest", `{"key": "k1"}`).unwrap();
+    let g = grpc_conn.call(c, "/raygrpc.demo.KeyValue/Get", key, no_md(), 2000).unwrap();
+    assert_eq(json_of(reg, "raygrpc.demo.GetReply", g.message), "{\"value\":\"aGVsbG8=\"}");
+    // The codec round trip on the server keeps every byte of protoc's message.
+    let every = fs.read_file_bytes("tests/fixtures/everything.bin").unwrap();
+    let rt = grpc_conn.call(c, "/raygrpc.demo.Echo/Roundtrip", every, no_md(), 2000).unwrap();
+    assert_eq(rt.status, 0);
+    assert_eq(rt.message, every);
+    // Deadlines: a call that outlives its grpc-timeout is DEADLINE_EXCEEDED, the next one works.
+    let slow = codec.from_json(reg, "raygrpc.demo.EchoRequest", `{"delayMs": 1500}`).unwrap();
+    let t0 = time.monotonic();
+    match (grpc_conn.call(c, "/raygrpc.demo.Echo/Echo", slow, no_md(), 200)) {
+        Result.Ok(d) => assert_eq(d.status, grpc_status.DEADLINE_EXCEEDED),
+        Result.Err(_) => {},
+    }
+    assert(time.monotonic() - t0 < 1400);
+    let after = grpc_conn.call(c, "/raygrpc.demo.Greeter/SayHello", hello("again"), no_md(), 5000).unwrap();
+    assert_eq(after.status, 0);
+    grpc_conn.disconnect(c);
+
+    // raygrpc's client: headers and trailers apart, metadata echoed.
+    let s = h2client.dial("127.0.0.1", port, h2client.Transport.Plain, 2000).unwrap();
+    let md: Map<string, string> = Map.new();
+    md.insert("echo-color", "blue");
+    md.insert("x-request-id", "42");
+    let er = h2client.unary(s, "/raygrpc.demo.Echo/Echo", codec.from_json(reg, "raygrpc.demo.EchoRequest", `{"message": "hi"}`).unwrap(), md, 3000).unwrap();
+    assert_eq(er.code, 0);
+    let body = json_of(reg, "raygrpc.demo.EchoReply", er.message);
+    assert(body.contains("\"x-request-id\":\"42\""));
+    if (own_server) {
+        assert_eq(er.trailers.get_or("echo-color", ""), "blue");
+        assert_eq(er.headers.get_or("x-raygrpc-server", ""), "0.1");
+        assert(body.contains("\"deadlineMs\":\""));
+    }
+    h2client.hangup(s);
+}
+
+fn check_reflection(port: int, t: h2client.Transport) {
+    let s = h2client.dial("localhost", port, t, 2000).unwrap();
+    let r = loader.open_reflection(s, no_md(), 5000).unwrap();
+    let names = loader.list_services(r).unwrap();
+    assert(names.contains("raygrpc.demo.KeyValue"));
+    let reg = schema.registry();
+    loader.fetch_symbol(r, reg, "raygrpc.demo.Echo").unwrap();
+    assert(schema.method(reg, "raygrpc.demo.Echo/Roundtrip").is_ok());
+    assert(schema.message(reg, "raygrpc.common.Point").is_ok());
+    assert(loader.fetch_symbol(r, reg, "no.Such").is_err());
+    loader.finish_reflection(r);
+    h2client.hangup(s);
+}
+
+@test
+fn servers_clients_and_reflection_end_to_end() {
+    let reg = loader.demo_registry().unwrap();
+    let stop: Channel<int> = Channel.new();
+    let own = start_raygrpc("", "", stop);
+    let netp = start_net(stop);
+    check_server(own, reg, true);
+    check_server(netp, reg, false);
+    check_reflection(own, h2client.Transport.Plain);
+
+    // TLS: throwaway CA + leaf; raylang's TLS server does not negotiate ALPN, so the
+    // client goes without it (net/grpc_conn.connect_tls refuses such a server).
+    let dir = fs.make_temp_dir("raygrpc-e2e").unwrap();
+    let made = process.run("sh", ["scripts/certs.sh", dir]);
+    let have_openssl = match (made) {
+        Result.Ok(o) => match (o.exit) {
+            process.Exit.Code(n) => n == 0,
+            _ => false,
+        },
+        Result.Err(_) => false,
+    };
+    if (have_openssl) {
+        let cert = fs.read_file("${dir}/leaf.pem").unwrap();
+        let key = fs.read_file("${dir}/leaf.key.pem").unwrap();
+        let tls = start_raygrpc(cert, key, stop);
+        let s = h2client.dial("localhost", tls, h2client.Transport.TlsInsecure, 2000).unwrap();
+        let r = h2client.unary(s, "/raygrpc.demo.Greeter/SayHello", hello("tls"), no_md(), 2000).unwrap();
+        assert_eq(r.code, 0);
+        assert_eq(json_of(reg, "raygrpc.demo.HelloReply", r.message), "{\"message\":\"Hello, tls!\"}");
+        h2client.hangup(s);
+        check_reflection(tls, h2client.Transport.TlsInsecure);
+        // Without SSL_CERT_FILE the throwaway CA is unknown; with it, ALPN fails (make interop).
+        match (grpc_conn.connect_tls("localhost", tls)) {
+            Result.Ok(_) => panic("connect_tls should refuse this server"),
+            Result.Err(e) => assert_eq_msg(e.contains("ALPN") || e.contains("UnknownIssuer"), true, e),
+        }
+    } else {
+        eprint("e2e: openssl not found, TLS part skipped");
+    }
+    fs.remove_all(dir);
+    close(stop);
+}

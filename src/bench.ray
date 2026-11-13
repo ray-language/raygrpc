@@ -1,0 +1,157 @@
+//! `raygrpc bench`: unary calls per second with N concurrent fibers, each on its own
+//! persistent connection (net/grpc_conn by default, or raygrpc's client), plus latency
+//! percentiles.
+
+import cli;
+import client;
+import codec;
+import h2client;
+import schema;
+import net/grpc_conn;
+import std/math;
+import std/time;
+
+struct WorkerResult {
+    calls: int,
+    errors: int,
+    latencies_us: [int],
+    first_error: string,
+}
+
+/// One fiber: calls in a loop until `until` (monotonic ms).
+fn worker(host: string, port: int, plain: bool, engine: string, path: string, msg: bytes, until: int) -> WorkerResult {
+    let res = WorkerResult { calls: 0, errors: 0, latencies_us: [], first_error: "" };
+    let md: Map<string, string> = Map.new();
+    if (engine == "raygrpc") {
+        let t = if (plain) { h2client.Transport.Plain } else { h2client.Transport.TlsNoAlpn };
+        let s = match (h2client.dial(host, port, t, 5000)) {
+            Result.Ok(x) => x,
+            Result.Err(e) => {
+                res.errors = 1;
+                res.first_error = e;
+                return res;
+            },
+        };
+        while (time.monotonic() < until) {
+            let t0 = (time.monotonic_nanos() / 1000);
+            match (h2client.unary(s, path, msg, md, 0)) {
+                Result.Ok(r) => {
+                    if (r.code == 0) {
+                        res.calls = res.calls + 1;
+                        res.latencies_us.push((time.monotonic_nanos() / 1000) - t0);
+                    } else {
+                        res.errors = res.errors + 1;
+                        if (res.first_error == "") {
+                            res.first_error = "status ${r.code}: ${r.status_message}";
+                        }
+                    }
+                },
+                Result.Err(e) => {
+                    res.errors = res.errors + 1;
+                    res.first_error = e;
+                    break;
+                },
+            }
+        }
+        h2client.hangup(s);
+        return res;
+    }
+    let c = match (if (plain) { grpc_conn.connect(host, port) } else { grpc_conn.connect_tls(host, port) }) {
+        Result.Ok(x) => x,
+        Result.Err(e) => {
+            res.errors = 1;
+            res.first_error = e;
+            return res;
+        },
+    };
+    while (time.monotonic() < until) {
+        let t0 = (time.monotonic_nanos() / 1000);
+        match (grpc_conn.call(c, path, msg, md, 0)) {
+            Result.Ok(r) => {
+                if (r.status == 0) {
+                    res.calls = res.calls + 1;
+                    res.latencies_us.push((time.monotonic_nanos() / 1000) - t0);
+                } else {
+                    res.errors = res.errors + 1;
+                    if (res.first_error == "") {
+                        res.first_error = "status ${r.status}: ${r.status_message}";
+                    }
+                }
+            },
+            Result.Err(e) => {
+                res.errors = res.errors + 1;
+                res.first_error = e;
+                break;
+            },
+        }
+    }
+    grpc_conn.disconnect(c);
+    res
+}
+
+fn percentile(sorted: [int], p: int) -> int {
+    if (sorted.len() == 0) {
+        return 0;
+    }
+    let i = math.min(sorted.len() - 1, sorted.len() * p / 100);
+    sorted[i]
+}
+
+pub fn run(a: cli.Args) -> Result<int, string> {
+    if (a.positional.len() != 1) {
+        return Result.Err("usage: raygrpc bench [flags] HOST:PORT  (-method, -d, -c, -duration)");
+    }
+    let (host, port) = cli.host_port(a.positional[0])?;
+    let method_name = cli.value_or(a, "method", "raygrpc.demo.Greeter/SayHello");
+    let body = cli.value_or(a, "d", "{\"name\": \"bench\"}");
+    let conc = cli.int_value(a, "c", 8)?;
+    let dur = cli.seconds_ms(a, "duration")?;
+    let duration_ms = if (dur > 0) { dur } else { 5000 };
+    let engine = cli.value_or(a, "client", "net");
+    let plain = cli.has(a, "plaintext");
+    let svc_name = method_name.replace("/", ".");
+    let svc = svc_name.substring(0, svc_name.last_index_of(".").unwrap_or(0));
+    let md: Map<string, string> = Map.new();
+    let reg = client.schema_for(a, host, port, [svc], md)?;
+    let (s, m) = schema.method(reg, method_name)?;
+    let msg = codec.from_json(reg, m.input_type, body)?;
+    let path = "/${s.full_name}/${m.name}";
+
+    let results: Channel<WorkerResult> = Channel.bounded(conc);
+    let started = time.monotonic();
+    let until = started + duration_ms;
+    for i in 0..conc {
+        spawn(fn() {
+            send(results, worker(host, port, plain, engine, path, msg, until));
+        });
+    }
+    var calls = 0;
+    var errors = 0;
+    var lat: [int] = [];
+    var first_error = "";
+    for i in 0..conc {
+        match (recv(results)) {
+            Option.Some(r) => {
+                calls = calls + r.calls;
+                errors = errors + r.errors;
+                lat = lat + r.latencies_us;
+                if (first_error == "" && r.first_error != "") {
+                    first_error = r.first_error;
+                }
+            },
+            Option.None => break,
+        }
+    }
+    let elapsed = time.monotonic() - started;
+    lat = sort(lat);
+    let rate = if (elapsed > 0) { calls * 1000 / elapsed } else { 0 };
+    print("method       ${path}");
+    print("client       ${if (engine == "raygrpc") { "raygrpc (net/grpc_h2)" } else { "net/grpc_conn" }}, ${conc} fibers, 1 connection each, ${if (plain) { "h2c" } else { "TLS" }}");
+    print("calls        ${calls} ok, ${errors} errors in ${elapsed} ms");
+    print("rate         ${rate} calls/s");
+    print("latency      p50 ${percentile(lat, 50)} us, p90 ${percentile(lat, 90)} us, p99 ${percentile(lat, 99)} us, max ${percentile(lat, 100)} us");
+    if (first_error != "") {
+        print("first error  ${first_error}");
+    }
+    Result.Ok(if (calls > 0) { 0 } else { 1 })
+}

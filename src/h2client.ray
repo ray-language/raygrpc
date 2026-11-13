@@ -1,0 +1,289 @@
+//! raygrpc's own gRPC client, on `net/grpc_h2`, for what `net/grpc_conn` cannot do:
+//! streaming calls (server reflection), TLS without certificate verification (-insecure),
+//! TLS without ALPN (raylang's own TLS servers do not negotiate it), and the response
+//! headers and trailers kept apart (-v).
+
+import net/grpc_h2 as h2;
+import net/grpc_status;
+import net/hpack;
+import net/http2;
+import std/net;
+import std/protobuf;
+import std/time;
+
+pub enum Transport {
+    /// h2c: HTTP/2 over plain TCP with prior knowledge.
+    Plain,
+    /// TLS with ALPN "h2", certificate verified (trust: the system store or SSL_CERT_FILE).
+    Tls,
+    /// TLS, certificate verified, no ALPN (for servers that do not negotiate it).
+    TlsNoAlpn,
+    /// TLS without verifying the certificate (development only); no ALPN either.
+    TlsInsecure,
+}
+
+pub struct Session {
+    link: h2.Link,
+    authority: string,
+    scheme: string,
+    next_id: int,
+    /// The stream being read, its unparsed DATA and whether it ended.
+    buf: [bytes],
+}
+
+pub enum Event {
+    Headers(Map<string, string>),
+    Message(bytes),
+    /// The final status: code, message, trailers.
+    End(int, string, Map<string, string>),
+}
+
+pub fn dial(host: string, port: int, t: Transport, connect_ms: int) -> Result<Session, string> {
+    let ms = if (connect_ms > 0) { connect_ms } else { 10000 };
+    let h = match (t) {
+        Transport.Plain => net.tcp_connect_timeout(host, port, ms)?,
+        Transport.Tls => net.tls_connect_h2(host, port)?,
+        Transport.TlsNoAlpn => net.tls_connect(host, port)?,
+        Transport.TlsInsecure => {
+            let raw = net.tcp_connect_timeout(host, port, ms)?;
+            net.tls_upgrade_insecure(raw, host)?
+        },
+    };
+    net.set_nodelay(h, true);
+    let link = h2.new_link(h);
+    h2.write(link, bytes_concat([http2.preface(), http2.settings_empty()]))?;
+    let scheme = match (t) {
+        Transport.Plain => "http",
+        _ => "https",
+    };
+    Result.Ok(Session { link: link, authority: "${host}:${port}", scheme: scheme, next_id: 1, buf: [] })
+}
+
+pub fn hangup(s: Session) {
+    h2.send_goaway(s.link, 0, h2.NO_ERROR);
+    close(s.link.h);
+}
+
+/// grpc-timeout: at most 8 digits, so large values move to a coarser unit.
+pub fn timeout_header(ms: int) -> string {
+    if (ms < 100000000) {
+        return "${ms}m";
+    }
+    let s = ms / 1000;
+    if (s < 100000000) {
+        return "${s}S";
+    }
+    "${s / 60}M"
+}
+
+/// Opens a stream for `path` and sends the request headers.
+pub fn open(s: Session, path: string, metadata: Map<string, string>, timeout_ms: int) -> Result<int, string> {
+    let id = s.next_id;
+    s.next_id = s.next_id + 2;
+    var hs = [
+        h2.hdr(":method", "POST"),
+        h2.hdr(":scheme", s.scheme),
+        h2.hdr(":path", path),
+        h2.hdr(":authority", s.authority),
+        h2.hdr("content-type", "application/grpc"),
+        h2.hdr("te", "trailers"),
+        h2.hdr("user-agent", "raygrpc/0.1"),
+    ];
+    if (timeout_ms > 0) {
+        hs.push(h2.hdr("grpc-timeout", timeout_header(timeout_ms)));
+        h2.set_deadline(s.link, time.monotonic() + timeout_ms);
+    } else {
+        h2.set_deadline(s.link, 0);
+    }
+    for (k, v) in metadata {
+        hs.push(h2.hdr(k.to_lower(), v));
+    }
+    h2.open_stream(s.link, id);
+    s.buf = [];
+    h2.send_headers(s.link, id, hs, false)?;
+    Result.Ok(id)
+}
+
+/// Sends one request message; `last` half-closes the stream.
+pub fn send_msg(s: Session, id: int, msg: bytes, last: bool) -> Result<int, string> {
+    let pending: [h2.Frame] = [];
+    let ok = h2.send_data(s.link, id, protobuf.grpc_frame(msg), last, fn(f: h2.Frame) -> Result<int, string> {
+        pending.push(f);
+        Result.Ok(0)
+    })?;
+    if (!ok) {
+        return Result.Err("the server closed the stream");
+    }
+    if (pending.len() > 0) {
+        // A response arrived while we were blocked on flow control: replay it later.
+        s.link.buf = bytes_concat(frames_bytes(pending) + [s.link.buf]);
+    }
+    Result.Ok(0)
+}
+
+fn frames_bytes(fs: [h2.Frame]) -> [bytes] {
+    var out: [bytes] = [];
+    for f in fs {
+        out.push(http2.encode_frame(f.ftype, f.flags, f.stream_id, f.payload));
+    }
+    out
+}
+
+/// Half-closes the request side.
+pub fn close_send(s: Session, id: int) -> Result<int, string> {
+    h2.write(s.link, http2.data_frame(id, bytes_of([]), true))
+}
+
+pub fn cancel(s: Session, id: int) {
+    h2.send_reset(s.link, id, h2.CANCEL);
+    h2.close_stream(s.link, id);
+}
+
+fn header_map(hs: [hpack.HEntry]) -> Map<string, string> {
+    let m: Map<string, string> = Map.new();
+    for e in hs {
+        match (m.get(e.name)) {
+            Option.Some(old) => m.insert(e.name, "${old}, ${e.value}"),
+            Option.None => m.insert(e.name, e.value),
+        }
+    }
+    m
+}
+
+fn next_message(s: Session) -> Option<bytes> {
+    let all = bytes_concat(s.buf);
+    if (all.len() < 5) {
+        return Option.None;
+    }
+    let n = (all[1] << 24) | (all[2] << 16) | (all[3] << 8) | all[4];
+    if (all.len() - 5 < n) {
+        s.buf = [all];
+        return Option.None;
+    }
+    s.buf = if (all.len() > 5 + n) { [all.sub_bytes(5 + n, all.len())] } else { [] };
+    Option.Some(all.sub_bytes(5, 5 + n))
+}
+
+fn end_of(m: Map<string, string>) -> Event {
+    let code = parse_int(m.get_or("grpc-status", "2")).unwrap_or(2);
+    let msg = grpc_status.percent_decode(m.get_or("grpc-message", ""));
+    Event.End(code, msg, m)
+}
+
+/// The next event of stream `id`: response headers, a message, or the end.
+pub fn next(s: Session, id: int) -> Result<Event, string> {
+    match (next_message(s)) {
+        Option.Some(m) => return Result.Ok(Event.Message(m)),
+        Option.None => {},
+    }
+    while (true) {
+        let fr = match (h2.read_frame(s.link)) {
+            Result.Ok(f) => f,
+            Result.Err(e) => {
+                if (h2.expired(s.link)) {
+                    cancel(s, id);
+                    return Result.Ok(Event.End(4, "context deadline exceeded", Map.new()));
+                }
+                return Result.Err(e);
+            },
+        };
+        if (h2.control(s.link, fr)?) {
+            if (s.link.goaway && s.link.goaway_last_stream < id) {
+                return Result.Err("the server sent GOAWAY");
+            }
+            continue;
+        }
+        if (fr.stream_id != id) {
+            if (fr.ftype == h2.DATA) {
+                h2.release(s.link, fr, false)?;
+            }
+            continue;
+        }
+        if (fr.ftype == h2.HEADERS) {
+            let m = header_map(h2.decode_headers(s.link, fr.payload)?);
+            if (m.contains_key("grpc-status")) {
+                h2.close_stream(s.link, id);
+                return Result.Ok(end_of(m));
+            }
+            let st = m.get_or(":status", "");
+            if (st != "200") {
+                h2.close_stream(s.link, id);
+                return Result.Ok(Event.End(http_to_grpc(st), "unexpected HTTP status code received from server: ${st}", m));
+            }
+            if ((fr.flags & h2.END_STREAM) != 0) {
+                h2.close_stream(s.link, id);
+                return Result.Ok(Event.End(13, "server closed the stream without sending trailers", m));
+            }
+            return Result.Ok(Event.Headers(m));
+        }
+        if (fr.ftype == h2.DATA) {
+            h2.release(s.link, fr, true)?;
+            s.buf.push(fr.payload);
+            match (next_message(s)) {
+                Option.Some(m) => return Result.Ok(Event.Message(m)),
+                Option.None => {},
+            }
+            if ((fr.flags & h2.END_STREAM) != 0) {
+                h2.close_stream(s.link, id);
+                let none: Map<string, string> = Map.new();
+                return Result.Ok(Event.End(13, "server closed the stream without sending trailers", none));
+            }
+        } else if (fr.ftype == h2.RST_STREAM) {
+            h2.close_stream(s.link, id);
+            let none: Map<string, string> = Map.new();
+            return Result.Ok(Event.End(13, "stream terminated by RST_STREAM with error code: ${http2.rst_error_code(fr.payload)}", none));
+        }
+    }
+}
+
+fn http_to_grpc(st: string) -> int {
+    match (st) {
+        "400" => 13,
+        "401" => 16,
+        "403" => 7,
+        "404" => 12,
+        "429" => 14,
+        "502" => 14,
+        "503" => 14,
+        "504" => 14,
+        _ => 2,
+    }
+}
+
+/// The whole of a unary call.
+pub struct Reply {
+    headers: Map<string, string>,
+    message: bytes,
+    code: int,
+    status_message: string,
+    trailers: Map<string, string>,
+}
+
+pub fn unary(s: Session, path: string, msg: bytes, metadata: Map<string, string>, timeout_ms: int) -> Result<Reply, string> {
+    let id = open(s, path, metadata, timeout_ms)?;
+    send_msg(s, id, msg, true)?;
+    let headers: Map<string, string> = Map.new();
+    let none: Map<string, string> = Map.new();
+    let r = Reply { headers: headers, message: bytes_of([]), code: 2, status_message: "", trailers: none };
+    var got = 0;
+    while (true) {
+        match (next(s, id)?) {
+            Event.Headers(m) => r.headers = m,
+            Event.Message(b) => {
+                r.message = b;
+                got = got + 1;
+            },
+            Event.End(code, text, m) => {
+                r.code = code;
+                r.status_message = text;
+                r.trailers = m;
+                break;
+            },
+        }
+    }
+    if (r.code == 0 && got != 1) {
+        r.code = 12;
+        r.status_message = "unary call answered with ${got} messages";
+    }
+    Result.Ok(r)
+}

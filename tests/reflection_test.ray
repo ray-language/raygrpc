@@ -1,0 +1,98 @@
+// The reflection protocol messages and the server-side index, without a network.
+
+import descriptor;
+import loader;
+import reflection;
+import schema;
+import wire;
+
+fn index() -> reflection.Index {
+    reflection.index_of(loader.demo_registry().unwrap())
+}
+
+fn ask(ix: reflection.Index, a: reflection.Ask) -> reflection.Answer {
+    let bytes_in = wire.encode(reflection.request(a));
+    let out = reflection.answer_bytes(ix, bytes_in).unwrap();
+    wire.decode_into(reflection.empty_response(), out).unwrap().answer
+}
+
+@test
+fn list_services_names_every_service() {
+    match (ask(index(), reflection.Ask.ListServices("*"))) {
+        reflection.Answer.Services(names) => assert_eq(names, ["grpc.reflection.v1.ServerReflection", "raygrpc.demo.Echo", "raygrpc.demo.Greeter", "raygrpc.demo.KeyValue"]),
+        _ => panic("expected services"),
+    }
+}
+
+@test
+fn a_symbol_comes_with_its_dependencies_first() {
+    let ix = index();
+    for sym in ["raygrpc.demo.Echo", "raygrpc.demo.Echo.Echo", "raygrpc.demo.Everything.Nested.Inner", "raygrpc.demo.Everything.f_uint64"] {
+        match (ask(ix, reflection.Ask.ContainingSymbol(sym))) {
+            reflection.Answer.Files(fs) => {
+                assert_eq(fs.len(), 2);
+                assert_eq(descriptor.decode_file(fs[0]).unwrap().name, "common.proto");
+                assert_eq(descriptor.decode_file(fs[1]).unwrap().name, "demo.proto");
+            },
+            _ => panic("expected files for ${sym}"),
+        }
+    }
+    match (ask(ix, reflection.Ask.ByFilename("common.proto"))) {
+        reflection.Answer.Files(fs) => assert_eq(fs.len(), 1),
+        _ => panic("expected one file"),
+    }
+}
+
+@test
+fn unknown_names_are_not_found() {
+    let ix = index();
+    match (ask(ix, reflection.Ask.ContainingSymbol("no.Such"))) {
+        reflection.Answer.Error(code, msg) => {
+            assert_eq(code, 5);
+            assert(msg.contains("no.Such"));
+        },
+        _ => panic("expected NOT_FOUND"),
+    }
+    match (ask(ix, reflection.Ask.ByFilename("nope.proto"))) {
+        reflection.Answer.Error(code, _) => assert_eq(code, 5),
+        _ => panic("expected NOT_FOUND"),
+    }
+    match (ask(ix, reflection.Ask.ContainingExtension("raygrpc.demo.Everything", 100))) {
+        reflection.Answer.Error(code, _) => assert_eq(code, 5),
+        _ => panic("expected NOT_FOUND"),
+    }
+    match (ask(ix, reflection.Ask.ExtensionNumbers("raygrpc.demo.Everything"))) {
+        reflection.Answer.ExtensionNumbers(base, ns) => {
+            assert_eq(base, "raygrpc.demo.Everything");
+            assert_eq(ns.len(), 0);
+        },
+        _ => panic("expected an empty extension list"),
+    }
+}
+
+@test
+fn the_response_echoes_the_request() {
+    let ix = index();
+    let req = reflection.Request { host: "example:1", ask: reflection.Ask.ByFilename("demo.proto") };
+    let out = reflection.answer_bytes(ix, wire.encode(req)).unwrap();
+    let resp = wire.decode_into(reflection.empty_response(), out).unwrap();
+    assert_eq(resp.valid_host, "example:1");
+    assert_eq(resp.original.host, "example:1");
+    match (resp.original.ask) {
+        reflection.Ask.ByFilename(f) => assert_eq(f, "demo.proto"),
+        _ => panic("original request lost"),
+    }
+    // The reflection service's own schema is served too, so describe works on it.
+    match (ask(ix, reflection.Ask.ContainingSymbol("grpc.reflection.v1.ServerReflection"))) {
+        reflection.Answer.Files(fs) => {
+            let f = descriptor.decode_file(fs[0]).unwrap();
+            assert_eq(f.package, "grpc.reflection.v1");
+        },
+        _ => panic("expected the reflection proto"),
+    }
+}
+
+@test
+fn garbage_requests_fail_cleanly() {
+    assert(reflection.answer_bytes(index(), bytes_of([0x1A, 0x09, 0x41])).is_err());
+}

@@ -1,0 +1,488 @@
+//! The client commands: `call`, `list` and `describe`, with grpcurl's output conventions
+//! (pretty JSON, `ERROR:` blocks, exit code 64 + status code).
+
+import cli;
+import codec;
+import h2client;
+import loader;
+import schema;
+import net/grpc_client;
+import net/grpc_conn;
+import std/fs;
+import std/io;
+import std/json;
+import std/time;
+
+/// Go's names for the status codes (grpcurl prints them).
+pub fn code_title(code: int) -> string {
+    match (code) {
+        0 => "OK",
+        1 => "Canceled",
+        2 => "Unknown",
+        3 => "InvalidArgument",
+        4 => "DeadlineExceeded",
+        5 => "NotFound",
+        6 => "AlreadyExists",
+        7 => "PermissionDenied",
+        8 => "ResourceExhausted",
+        9 => "FailedPrecondition",
+        10 => "Aborted",
+        11 => "OutOfRange",
+        12 => "Unimplemented",
+        13 => "Internal",
+        14 => "Unavailable",
+        15 => "DataLoss",
+        16 => "Unauthenticated",
+        _ => "Code(${code})",
+    }
+}
+
+/// What a call came back with, whatever client carried it.
+pub struct Outcome {
+    code: int,
+    message: string,
+    body: bytes,
+    headers: Map<string, string>,
+    trailers: Map<string, string>,
+    /// net/grpc_conn merges headers and trailers into one map.
+    merged: bool,
+}
+
+pub fn transport_of(a: cli.Args) -> h2client.Transport {
+    if (cli.has(a, "plaintext")) {
+        return h2client.Transport.Plain;
+    }
+    if (cli.has(a, "insecure")) {
+        return h2client.Transport.TlsInsecure;
+    }
+    if (cli.has(a, "no-alpn")) {
+        return h2client.Transport.TlsNoAlpn;
+    }
+    h2client.Transport.Tls
+}
+
+/// Which client carries a unary call: net's persistent client unless the flags need ours.
+fn engine_of(a: cli.Args) -> string {
+    let explicit = cli.value_or(a, "client", "");
+    if (explicit != "") {
+        return explicit;
+    }
+    if (cli.has(a, "oneshot")) {
+        return "oneshot";
+    }
+    if (cli.has(a, "insecure") || cli.has(a, "no-alpn") || cli.has(a, "v")) {
+        return "raygrpc";
+    }
+    "net"
+}
+
+fn empty_map() -> Map<string, string> {
+    let m: Map<string, string> = Map.new();
+    m
+}
+
+/// One unary call with the chosen client.
+pub fn unary(a: cli.Args, host: string, port: int, path: string, msg: bytes, md: Map<string, string>, timeout_ms: int) -> Result<Outcome, string> {
+    let engine = engine_of(a);
+    let plain = cli.has(a, "plaintext");
+    if (engine == "net") {
+        let c = if (plain) { grpc_conn.connect(host, port)? } else { grpc_conn.connect_tls(host, port)? };
+        let r = grpc_conn.call(c, path, msg, md, timeout_ms);
+        grpc_conn.disconnect(c);
+        let reply = r?;
+        return Result.Ok(Outcome { code: reply.status, message: reply.status_message, body: reply.message, headers: reply.metadata, trailers: empty_map(), merged: true });
+    }
+    if (engine == "oneshot") {
+        // net/grpc_client: TLS + ALPN only, no metadata, no deadline, no grpc-message.
+        if (plain) {
+            return Result.Err("-oneshot (net/grpc_client) only speaks TLS");
+        }
+        let r = grpc_client.grpc_call(host, port, path, msg)?;
+        return Result.Ok(Outcome { code: r.grpc_status, message: "", body: r.message, headers: empty_map(), trailers: empty_map(), merged: true });
+    }
+    if (engine != "raygrpc") {
+        return Result.Err("-client must be net, raygrpc or oneshot");
+    }
+    let s = h2client.dial(host, port, transport_of(a), cli.seconds_ms(a, "connect-timeout")?)?;
+    let r = h2client.unary(s, path, msg, md, timeout_ms);
+    h2client.hangup(s);
+    let reply = r?;
+    Result.Ok(Outcome { code: reply.code, message: reply.status_message, body: reply.message, headers: reply.headers, trailers: reply.trailers, merged: false })
+}
+
+/// Prints an error the way grpcurl does and returns its exit code.
+pub fn print_status_error(a: cli.Args, code: int, message: string) -> int {
+    if (cli.has(a, "format-error")) {
+        let o = json.obj().field("code", code).field("message", message);
+        print(json.render_pretty(o, 2));
+    } else {
+        eprint("ERROR:\n  Code: ${code_title(code)}\n  Message: ${message}");
+    }
+    64 + code
+}
+
+fn print_metadata(title: string, m: Map<string, string>) {
+    print("\n${title}");
+    let keys = sort(m.keys());
+    if (keys.len() == 0) {
+        print("(empty)");
+    }
+    for k in keys {
+        print("${k}: ${m.get_or(k, "")}");
+    }
+}
+
+/// The schema for a call or describe: files if given, else the server's reflection.
+pub fn schema_for(a: cli.Args, host: string, port: int, symbols: [string], md: Map<string, string>) -> Result<schema.Registry, string> {
+    if (loader.has_files(a)) {
+        return loader.from_files(a);
+    }
+    let s = h2client.dial(host, port, transport_of(a), cli.seconds_ms(a, "connect-timeout")?)?;
+    let reg = schema.registry();
+    let r = loader.open_reflection(s, md, cli.seconds_ms(a, "max-time")?)?;
+    var result: Result<int, string> = Result.Ok(0);
+    for sym in symbols {
+        result = loader.fetch_symbol(r, reg, sym);
+        if (result.is_err()) {
+            break;
+        }
+    }
+    loader.finish_reflection(r);
+    h2client.hangup(s);
+    result?;
+    Result.Ok(reg)
+}
+
+/// Reads the request JSON: -d TEXT, or -d @ / -d @FILE.
+fn request_text(a: cli.Args) -> Result<string, string> {
+    let d = cli.value_or(a, "d", "");
+    if (d == "@") {
+        return read_stdin_text();
+    }
+    if (d.starts_with("@")) {
+        return read_file_text(d.substring(1, d.len()));
+    }
+    Result.Ok(d)
+}
+
+/// All of standard input.
+pub fn read_stdin_bytes() -> bytes {
+    var parts: [bytes] = [];
+    while (true) {
+        match (io.read(65536)) {
+            Option.Some(b) => {
+                if (b.len() == 0) {
+                    break;
+                }
+                parts.push(b);
+            },
+            Option.None => break,
+        }
+    }
+    bytes_concat(parts)
+}
+
+fn read_stdin_text() -> Result<string, string> {
+    from_utf8(read_stdin_bytes())
+}
+
+fn read_file_text(path: string) -> Result<string, string> {
+    fs.read_file(path)
+}
+
+/// `raygrpc call HOST:PORT pkg.Service/Method`
+pub fn call(a: cli.Args) -> Result<int, string> {
+    if (a.positional.len() != 2) {
+        return Result.Err("usage: raygrpc call [flags] HOST:PORT pkg.Service/Method");
+    }
+    let (host, port) = cli.host_port(a.positional[0])?;
+    let method_name = a.positional[1];
+    let md = cli.metadata(a)?;
+    let timeout_ms = cli.seconds_ms(a, "max-time")?;
+    let svc_name = match (method_name.replace("/", ".").last_index_of(".")) {
+        Option.Some(i) => method_name.replace("/", ".").substring(0, i),
+        Option.None => return Result.Err("method must be pkg.Service/Method: ${method_name}"),
+    };
+    let reg = match (schema_for(a, host, port, [svc_name], md)) {
+        Result.Ok(r) => r,
+        Result.Err(e) => {
+            eprint("Error invoking method \"${method_name}\": ${e}");
+            return Result.Ok(1);
+        },
+    };
+    let (svc, m) = schema.method(reg, method_name)?;
+    if (m.client_streaming || m.server_streaming) {
+        return Result.Err("${svc.full_name}.${m.name} is a streaming method; raygrpc calls unary methods only");
+    }
+    let text = request_text(a)?;
+    let msg = match (codec.from_json(reg, m.input_type, text)) {
+        Result.Ok(b) => b,
+        Result.Err(e) => {
+            eprint("Error invoking method \"${method_name}\": error getting request data: ${e}");
+            return Result.Ok(1);
+        },
+    };
+    let path = "/${svc.full_name}/${m.name}";
+    let started = time.monotonic();
+    let out = match (unary(a, host, port, path, msg, md, timeout_ms)) {
+        Result.Ok(o) => o,
+        Result.Err(e) => {
+            if (e.contains("deadline") || e.contains("timeout")) {
+                return Result.Ok(print_status_error(a, 4, "context deadline exceeded"));
+            }
+            eprint("Failed to dial target host \"${a.positional[0]}\": ${e}");
+            return Result.Ok(1);
+        },
+    };
+    let verbose = cli.has(a, "v");
+    if (verbose) {
+        print("\nResolved method descriptor:\nrpc ${m.name} ( ${m.input_type} ) returns ( ${m.output_type} );");
+        print_metadata("Request metadata to send:", md);
+        print_metadata(if (out.merged) { "Response metadata (headers and trailers):" } else { "Response headers received:" }, out.headers);
+    }
+    if (out.code == 0) {
+        let opts = codec.options();
+        opts.emit_defaults = cli.has(a, "emit-defaults");
+        opts.proto_names = cli.has(a, "proto-names");
+        let doc = codec.to_json(reg, m.output_type, out.body, opts)?;
+        if (verbose) {
+            print("\nResponse contents:");
+        }
+        print(json.render_doc_pretty(doc, 2));
+    }
+    if (verbose) {
+        if (!out.merged) {
+            print_metadata("Response trailers received:", out.trailers);
+        }
+        let n = if (out.code == 0) { 1 } else { 0 };
+        print("Sent 1 request and received ${n} response${if (n == 1) { "" } else { "s" }} in ${time.monotonic() - started} ms");
+    }
+    if (out.code != 0) {
+        return Result.Ok(print_status_error(a, out.code, out.message));
+    }
+    Result.Ok(0)
+}
+
+/// `raygrpc list [HOST:PORT] [SERVICE]`
+pub fn list(a: cli.Args) -> Result<int, string> {
+    let files = loader.has_files(a);
+    let want_addr = if (files) { 0 } else { 1 };
+    if (a.positional.len() < want_addr || a.positional.len() > want_addr + 1) {
+        return Result.Err("usage: raygrpc list [flags] HOST:PORT [SERVICE]   (or -proto/-protoset without HOST:PORT)");
+    }
+    let service_arg = if (a.positional.len() > want_addr) { a.positional[want_addr] } else { "" };
+    if (files) {
+        let reg = loader.from_files(a)?;
+        return print_list(reg, schema.service_names(reg), service_arg);
+    }
+    let (host, port) = cli.host_port(a.positional[0])?;
+    let md = cli.metadata(a)?;
+    let s = h2client.dial(host, port, transport_of(a), cli.seconds_ms(a, "connect-timeout")?)?;
+    let r = loader.open_reflection(s, md, cli.seconds_ms(a, "max-time")?)?;
+    let names = loader.list_services(r);
+    let reg = schema.registry();
+    var fetched: Result<int, string> = Result.Ok(0);
+    if (service_arg != "" && names.is_ok()) {
+        fetched = loader.fetch_symbol(r, reg, service_arg);
+    }
+    loader.finish_reflection(r);
+    h2client.hangup(s);
+    let services = match (names) {
+        Result.Ok(n) => n,
+        Result.Err(e) => {
+            eprint("Failed to list services: ${e}");
+            return Result.Ok(1);
+        },
+    };
+    match (fetched) {
+        Result.Ok(_) => {},
+        Result.Err(e) => {
+            eprint("Failed to list methods for service \"${service_arg}\": ${e}");
+            return Result.Ok(1);
+        },
+    }
+    print_list(reg, services, service_arg)
+}
+
+fn print_list(reg: schema.Registry, services: [string], service_arg: string) -> Result<int, string> {
+    if (service_arg == "") {
+        for n in services {
+            print(n);
+        }
+        return Result.Ok(0);
+    }
+    let svc = match (schema.service(reg, service_arg)) {
+        Result.Ok(s) => s,
+        Result.Err(_) => {
+            eprint("Failed to list methods for service \"${service_arg}\": Service not found: ${service_arg}");
+            return Result.Ok(1);
+        },
+    };
+    for m in svc.methods {
+        print("${svc.full_name}.${m.name}");
+    }
+    Result.Ok(0)
+}
+
+/// `raygrpc describe [HOST:PORT] SYMBOL...`
+pub fn describe(a: cli.Args) -> Result<int, string> {
+    let files = loader.has_files(a);
+    let skip = if (files) { 0 } else { 1 };
+    if (a.positional.len() < skip) {
+        return Result.Err("usage: raygrpc describe [flags] HOST:PORT [SYMBOL...]");
+    }
+    var symbols = a.positional.slice(skip, a.positional.len());
+    var reg = schema.registry();
+    if (files) {
+        reg = loader.from_files(a)?;
+        if (symbols.len() == 0) {
+            symbols = schema.service_names(reg);
+        }
+    } else {
+        let (host, port) = cli.host_port(a.positional[0])?;
+        let md = cli.metadata(a)?;
+        let s = h2client.dial(host, port, transport_of(a), cli.seconds_ms(a, "connect-timeout")?)?;
+        let r = loader.open_reflection(s, md, cli.seconds_ms(a, "max-time")?)?;
+        var result: Result<int, string> = Result.Ok(0);
+        if (symbols.len() == 0) {
+            match (loader.list_services(r)) {
+                Result.Ok(n) => symbols = n,
+                Result.Err(e) => result = Result.Err(e),
+            }
+        }
+        for sym in symbols {
+            if (result.is_ok()) {
+                result = loader.fetch_symbol(r, reg, sym);
+            }
+        }
+        loader.finish_reflection(r);
+        h2client.hangup(s);
+        match (result) {
+            Result.Ok(_) => {},
+            Result.Err(e) => {
+                eprint("Failed to resolve symbol: ${e}");
+                return Result.Ok(1);
+            },
+        }
+    }
+    for sym in symbols {
+        match (describe_symbol(reg, schema.bare(sym))) {
+            Option.Some(text) => print(text),
+            Option.None => {
+                eprint("Failed to resolve symbol \"${sym}\": Symbol not found: ${sym}");
+                return Result.Ok(1);
+            },
+        }
+    }
+    Result.Ok(0)
+}
+
+// ---- describe output (grpcurl's protoprint style) ----
+
+fn field_type(reg: schema.Registry, f: schema.FieldDef) -> string {
+    if (f.kind == schema.T_MESSAGE || f.kind == schema.T_ENUM) {
+        return f.type_name;
+    }
+    schema.type_label(f.kind)
+}
+
+fn field_line(reg: schema.Registry, f: schema.FieldDef, indent: string) -> string {
+    var prefix = "";
+    var t = field_type(reg, f);
+    if (f.kind == schema.T_MESSAGE && schema.is_repeated(f)) {
+        match (schema.message(reg, f.type_name)) {
+            Result.Ok(entry) => {
+                if (entry.map_entry) {
+                    let k = schema.field_by_number(entry, 1).unwrap();
+                    let v = schema.field_by_number(entry, 2).unwrap();
+                    t = "map<${field_type(reg, k)}, ${field_type(reg, v)}>";
+                }
+            },
+            Result.Err(_) => {},
+        }
+    }
+    if (!t.starts_with("map<")) {
+        if (schema.is_repeated(f)) {
+            prefix = "repeated ";
+        } else if (f.proto3_optional) {
+            prefix = "optional ";
+        }
+    }
+    let opts = if (f.packed_off) { " [packed = false]" } else { "" };
+    "${indent}${prefix}${t} ${f.name} = ${f.number}${opts};\n"
+}
+
+fn enum_text(e: schema.EnumDef, indent: string) -> string {
+    var out = "${indent}enum ${e.name} {\n";
+    for v in e.values {
+        out = out + "${indent}  ${v.name} = ${v.number};\n";
+    }
+    out + "${indent}}\n"
+}
+
+fn message_text(reg: schema.Registry, m: schema.MessageDef, indent: string) -> string {
+    var out = "${indent}message ${m.name} {\n";
+    let inner = indent + "  ";
+    var done_oneofs: [int] = [];
+    for f in m.fields {
+        if (f.oneof_index >= 0 && !f.proto3_optional) {
+            if (done_oneofs.contains(f.oneof_index)) {
+                continue;
+            }
+            done_oneofs.push(f.oneof_index);
+            out = out + "${inner}oneof ${m.oneofs[f.oneof_index]} {\n";
+            for g in m.fields {
+                if (g.oneof_index == f.oneof_index) {
+                    out = out + field_line(reg, g, inner + "  ");
+                }
+            }
+            out = out + "${inner}}\n";
+        } else {
+            out = out + field_line(reg, f, inner);
+        }
+    }
+    for n in m.nested {
+        if (!n.map_entry) {
+            out = out + message_text(reg, n, inner) + "\n";
+        }
+    }
+    for e in m.enums {
+        out = out + enum_text(e, inner);
+    }
+    out + "${indent}}"
+}
+
+fn method_line(m: schema.MethodDef) -> string {
+    let cs = if (m.client_streaming) { "stream " } else { "" };
+    let ss = if (m.server_streaming) { "stream " } else { "" };
+    "rpc ${m.name} ( ${cs}${m.input_type} ) returns ( ${ss}${m.output_type} );"
+}
+
+pub fn describe_symbol(reg: schema.Registry, sym: string) -> Option<string> {
+    match (reg.services.get(sym)) {
+        Option.Some(s) => {
+            var out = "${sym} is a service:\nservice ${s.name} {\n";
+            for m in s.methods {
+                out = out + "  ${method_line(m)}\n";
+            }
+            return Option.Some(out + "}");
+        },
+        Option.None => {},
+    }
+    match (reg.messages.get(sym)) {
+        Option.Some(m) => return Option.Some("${sym} is a message:\n${message_text(reg, m, "")}"),
+        Option.None => {},
+    }
+    match (reg.enums.get(sym)) {
+        Option.Some(e) => {
+            let t = enum_text(e, "");
+            return Option.Some("${sym} is an enum:\n${t.substring(0, t.len() - 1)}");
+        },
+        Option.None => {},
+    }
+    match (schema.method(reg, sym)) {
+        Result.Ok((_, m)) => return Option.Some("${sym} is a method:\n${method_line(m)}"),
+        Result.Err(_) => {},
+    }
+    Option.None
+}
