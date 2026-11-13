@@ -126,7 +126,7 @@ rinden igual.
 
 ## Hallazgos de dogfood
 
-Borradores entregados para `findings/` (los números los pone `tools/findings`):
+Registrados en `ray-apps/findings/` (campaña `raygrpc-1.27.95`) como #384–#391, en este mismo orden:
 
 1. **[B] TLS de servidor sin ALPN.** `net.tls_accept` no anuncia `h2`: grpcurl (grpc-go ≥ 1.67)
    rechaza cualquier servidor gRPC-sobre-TLS de raylang («missing selected ALPN property»), y
