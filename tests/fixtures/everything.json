@@ -1,0 +1,8 @@
+{"fDouble": -2.5, "fFloat": 0.1, "fInt32": -7, "fInt64": "-9000000000", "fUint32": 4294967295,
+ "fUint64": "18446744073709551615", "fSint32": -2147483648, "fSint64": "-9223372036854775808",
+ "fFixed32": 4000000000, "fFixed64": "18446744073709551000", "fSfixed32": -5, "fSfixed64": "-6",
+ "fBool": true, "fString": "héllo\n\"x\"", "fBytes": "AAH/YWJj", "level": "HIGH", "point": {"x": -3, "y": 4},
+ "packedInts": [1, -1, 300], "packedSints": ["-1", "1", "-64"], "packedDoubles": [1.5, -0.0],
+ "unpackedFixed": [1, 2], "names": ["a", "b"], "path": [{"x": 1}, {"y": 2}], "counters": {"k": "-1"},
+ "pointsById": {"7": {"x": 1}}, "nestedChoice": {"label": "n", "inner": {"flags": [true, false]}, "mode": "SAFE"},
+ "maybe": 0, "nested": {"label": "deep"}}

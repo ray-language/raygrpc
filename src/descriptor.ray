@@ -1,0 +1,362 @@
+//! FileDescriptorProto (google/protobuf/descriptor.proto) ↔ the schema model.
+//!
+//! The reflection server sends these bytes and the reflection client reads them; `protoc
+//! --descriptor_set_out` writes the same messages, so the encoder is checked byte for byte
+//! against protoc. Each schema type implements `wire.Message`, and `decode_into` drives
+//! them generically.
+
+import schema;
+import wire;
+
+impl wire.Message for schema.EnumValueDef {
+    fn encode_to(self, w: wire.Writer) {
+        wire.write_string(w, 1, self.name);
+        wire.write_int32(w, 2, self.number);
+    }
+
+    fn merge_field(self, r: wire.Reader, t: wire.Tag) -> Result<bool, string> {
+        match (t.field) {
+            1 => self.name = wire.string_of(r, t)?,
+            2 => self.number = wire.to_i32(wire.varint_of(r, t)?),
+            _ => return Result.Ok(false),
+        }
+        Result.Ok(true)
+    }
+}
+
+impl wire.Message for schema.EnumDef {
+    fn encode_to(self, w: wire.Writer) {
+        wire.write_string(w, 1, self.name);
+        for v in self.values {
+            wire.write_message(w, 2, v);
+        }
+        if (self.allow_alias) {
+            let o = wire.writer();
+            wire.write_bool(o, 2, true);
+            wire.write_bytes(w, 3, wire.finish(o));
+        }
+    }
+
+    fn merge_field(self, r: wire.Reader, t: wire.Tag) -> Result<bool, string> {
+        match (t.field) {
+            1 => self.name = wire.string_of(r, t)?,
+            2 => self.values.push(wire.decode_into(empty_value(), wire.bytes_of_field(r, t)?)?),
+            3 => {
+                let opts = wire.parse_raw(wire.bytes_of_field(r, t)?)?;
+                for o in opts {
+                    if (o.field == 2) {
+                        self.allow_alias = match (o.value) {
+                            wire.Raw.Varint(v) => v != 0,
+                            _ => false,
+                        };
+                    }
+                }
+            },
+            _ => return Result.Ok(false),
+        }
+        Result.Ok(true)
+    }
+}
+
+impl wire.Message for schema.FieldDef {
+    fn encode_to(self, w: wire.Writer) {
+        wire.write_string(w, 1, self.name);
+        wire.write_int32(w, 3, self.number);
+        wire.write_int(w, 4, self.label);
+        wire.write_int(w, 5, self.kind);
+        if (self.type_name != "") {
+            wire.write_string(w, 6, self.type_name);
+        }
+        if (self.packed_off) {
+            let o = wire.writer();
+            wire.write_bool(o, 2, false);
+            wire.write_bytes(w, 8, wire.finish(o));
+        }
+        if (self.oneof_index >= 0) {
+            wire.write_int32(w, 9, self.oneof_index);
+        }
+        wire.write_string(w, 10, self.json_name);
+        if (self.proto3_optional) {
+            wire.write_bool(w, 17, true);
+        }
+    }
+
+    fn merge_field(self, r: wire.Reader, t: wire.Tag) -> Result<bool, string> {
+        match (t.field) {
+            1 => self.name = wire.string_of(r, t)?,
+            3 => self.number = wire.to_i32(wire.varint_of(r, t)?),
+            4 => self.label = wire.varint_of(r, t)?,
+            5 => self.kind = wire.varint_of(r, t)?,
+            6 => self.type_name = wire.string_of(r, t)?,
+            8 => {
+                let opts = wire.parse_raw(wire.bytes_of_field(r, t)?)?;
+                for o in opts {
+                    if (o.field == 2) {
+                        match (o.value) {
+                            wire.Raw.Varint(v) => self.packed_off = v == 0,
+                            _ => {},
+                        }
+                    }
+                }
+            },
+            9 => self.oneof_index = wire.to_i32(wire.varint_of(r, t)?),
+            10 => self.json_name = wire.string_of(r, t)?,
+            17 => self.proto3_optional = wire.bool_of(r, t)?,
+            _ => return Result.Ok(false),
+        }
+        Result.Ok(true)
+    }
+}
+
+/// OneofDescriptorProto only carries a name; a tiny wrapper so it can be a Message too.
+struct OneofName {
+    name: string,
+}
+
+impl wire.Message for OneofName {
+    fn encode_to(self, w: wire.Writer) {
+        wire.write_string(w, 1, self.name);
+    }
+
+    fn merge_field(self, r: wire.Reader, t: wire.Tag) -> Result<bool, string> {
+        if (t.field == 1) {
+            self.name = wire.string_of(r, t)?;
+            return Result.Ok(true);
+        }
+        Result.Ok(false)
+    }
+}
+
+impl wire.Message for schema.MessageDef {
+    fn encode_to(self, w: wire.Writer) {
+        wire.write_string(w, 1, self.name);
+        for f in self.fields {
+            wire.write_message(w, 2, f);
+        }
+        for n in self.nested {
+            wire.write_message(w, 3, n);
+        }
+        for e in self.enums {
+            wire.write_message(w, 4, e);
+        }
+        if (self.map_entry) {
+            let o = wire.writer();
+            wire.write_bool(o, 7, true);
+            wire.write_bytes(w, 7, wire.finish(o));
+        }
+        for o in self.oneofs {
+            wire.write_message(w, 8, OneofName { name: o });
+        }
+    }
+
+    fn merge_field(self, r: wire.Reader, t: wire.Tag) -> Result<bool, string> {
+        match (t.field) {
+            1 => self.name = wire.string_of(r, t)?,
+            2 => self.fields.push(wire.decode_into(empty_field(), wire.bytes_of_field(r, t)?)?),
+            3 => self.nested.push(wire.decode_into(schema.new_message("", ""), wire.bytes_of_field(r, t)?)?),
+            4 => self.enums.push(wire.decode_into(empty_enum(), wire.bytes_of_field(r, t)?)?),
+            7 => {
+                let opts = wire.parse_raw(wire.bytes_of_field(r, t)?)?;
+                for o in opts {
+                    if (o.field == 7) {
+                        match (o.value) {
+                            wire.Raw.Varint(v) => self.map_entry = v != 0,
+                            _ => {},
+                        }
+                    }
+                }
+            },
+            8 => {
+                let o = wire.decode_into(OneofName { name: "" }, wire.bytes_of_field(r, t)?)?;
+                self.oneofs.push(o.name);
+            },
+            _ => return Result.Ok(false),
+        }
+        Result.Ok(true)
+    }
+}
+
+impl wire.Message for schema.MethodDef {
+    fn encode_to(self, w: wire.Writer) {
+        wire.write_string(w, 1, self.name);
+        wire.write_string(w, 2, self.input_type);
+        wire.write_string(w, 3, self.output_type);
+        if (self.client_streaming) {
+            wire.write_bool(w, 5, true);
+        }
+        if (self.server_streaming) {
+            wire.write_bool(w, 6, true);
+        }
+    }
+
+    fn merge_field(self, r: wire.Reader, t: wire.Tag) -> Result<bool, string> {
+        match (t.field) {
+            1 => self.name = wire.string_of(r, t)?,
+            2 => self.input_type = wire.string_of(r, t)?,
+            3 => self.output_type = wire.string_of(r, t)?,
+            5 => self.client_streaming = wire.bool_of(r, t)?,
+            6 => self.server_streaming = wire.bool_of(r, t)?,
+            _ => return Result.Ok(false),
+        }
+        Result.Ok(true)
+    }
+}
+
+impl wire.Message for schema.ServiceDef {
+    fn encode_to(self, w: wire.Writer) {
+        wire.write_string(w, 1, self.name);
+        for m in self.methods {
+            wire.write_message(w, 2, m);
+        }
+    }
+
+    fn merge_field(self, r: wire.Reader, t: wire.Tag) -> Result<bool, string> {
+        match (t.field) {
+            1 => self.name = wire.string_of(r, t)?,
+            2 => self.methods.push(wire.decode_into(empty_method(), wire.bytes_of_field(r, t)?)?),
+            _ => return Result.Ok(false),
+        }
+        Result.Ok(true)
+    }
+}
+
+impl wire.Message for schema.FileDef {
+    fn encode_to(self, w: wire.Writer) {
+        wire.write_string(w, 1, self.name);
+        if (self.package != "") {
+            wire.write_string(w, 2, self.package);
+        }
+        for d in self.dependencies {
+            wire.write_string(w, 3, d);
+        }
+        for m in self.messages {
+            wire.write_message(w, 4, m);
+        }
+        for e in self.enums {
+            wire.write_message(w, 5, e);
+        }
+        for s in self.services {
+            wire.write_message(w, 6, s);
+        }
+        wire.write_string(w, 12, self.syntax);
+    }
+
+    fn merge_field(self, r: wire.Reader, t: wire.Tag) -> Result<bool, string> {
+        match (t.field) {
+            1 => self.name = wire.string_of(r, t)?,
+            2 => self.package = wire.string_of(r, t)?,
+            3 => self.dependencies.push(wire.string_of(r, t)?),
+            4 => self.messages.push(wire.decode_into(schema.new_message("", ""), wire.bytes_of_field(r, t)?)?),
+            5 => self.enums.push(wire.decode_into(empty_enum(), wire.bytes_of_field(r, t)?)?),
+            6 => self.services.push(wire.decode_into(empty_service(), wire.bytes_of_field(r, t)?)?),
+            12 => self.syntax = wire.string_of(r, t)?,
+            _ => return Result.Ok(false),
+        }
+        Result.Ok(true)
+    }
+}
+
+fn empty_value() -> schema.EnumValueDef {
+    schema.EnumValueDef { name: "", number: 0 }
+}
+
+fn empty_enum() -> schema.EnumDef {
+    schema.EnumDef { name: "", full_name: "", values: [], allow_alias: false }
+}
+
+fn empty_field() -> schema.FieldDef {
+    schema.FieldDef {
+        name: "",
+        number: 0,
+        label: schema.L_OPTIONAL,
+        kind: 0,
+        type_name: "",
+        oneof_index: -1,
+        json_name: "",
+        proto3_optional: false,
+        packed_off: false,
+    }
+}
+
+fn empty_method() -> schema.MethodDef {
+    schema.MethodDef { name: "", input_type: "", output_type: "", client_streaming: false, server_streaming: false }
+}
+
+fn empty_service() -> schema.ServiceDef {
+    schema.ServiceDef { name: "", full_name: "", methods: [] }
+}
+
+/// FileDescriptorProto bytes of a (resolved) file.
+pub fn encode_file(f: schema.FileDef) -> bytes {
+    wire.encode(f)
+}
+
+fn scoped(scope: string, name: string) -> string {
+    if (scope == "") { name } else { "${scope}.${name}" }
+}
+
+fn fill_names(m: schema.MessageDef, scope: string) {
+    m.full_name = scoped(scope, m.name);
+    for f in m.fields {
+        if (f.json_name == "") {
+            f.json_name = schema.json_name_of(f.name);
+        }
+    }
+    for n in m.nested {
+        fill_names(n, m.full_name);
+    }
+    for e in m.enums {
+        e.full_name = scoped(m.full_name, e.name);
+    }
+}
+
+/// Decodes a FileDescriptorProto and computes the fully-qualified names the wire omits.
+pub fn decode_file(data: bytes) -> Result<schema.FileDef, string> {
+    let f = wire.decode_into(schema.new_file(""), data)?;
+    if (f.syntax == "") {
+        // proto2 files leave syntax unset; the codec still handles their proto3-compatible subset.
+        f.syntax = "proto2";
+    }
+    for m in f.messages {
+        fill_names(m, f.package);
+    }
+    for e in f.enums {
+        e.full_name = scoped(f.package, e.name);
+    }
+    for s in f.services {
+        s.full_name = scoped(f.package, s.name);
+    }
+    Result.Ok(f)
+}
+
+/// A FileDescriptorSet (what `protoc --descriptor_set_out` writes): `repeated
+/// FileDescriptorProto file = 1`.
+pub fn decode_set(data: bytes) -> Result<[schema.FileDef], string> {
+    var out: [schema.FileDef] = [];
+    for raw in wire.parse_raw(data)? {
+        if (raw.field == 1) {
+            match (raw.value) {
+                wire.Raw.Bytes(b) => out.push(decode_file(b)?),
+                _ => return Result.Err("FileDescriptorSet: field 1 is not a message"),
+            }
+        }
+    }
+    Result.Ok(out)
+}
+
+pub fn encode_set(files: [schema.FileDef]) -> bytes {
+    let w = wire.writer();
+    for f in files {
+        wire.write_bytes(w, 1, encode_file(f));
+    }
+    wire.finish(w)
+}
+
+/// A registry from decoded descriptors (reflection answers or a descriptor set).
+pub fn registry_of(files: [schema.FileDef]) -> schema.Registry {
+    let reg = schema.registry();
+    for f in files {
+        schema.add_file(reg, f);
+    }
+    reg
+}

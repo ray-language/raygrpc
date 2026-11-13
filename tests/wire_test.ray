@@ -1,0 +1,183 @@
+// The wire codec: varints (negative = 10 octets), zigzag, fixed, binary32 by hand, and a
+// reader that turns every malformed input into an Err.
+
+import wire;
+import std/math;
+import std/protobuf;
+
+fn varint_bytes(v: int) -> bytes {
+    let w = wire.writer();
+    wire.put_varint(w, v);
+    wire.finish(w)
+}
+
+fn read_back(b: bytes) -> int {
+    wire.read_varint(wire.reader(b)).unwrap()
+}
+
+@test
+fn varints_round_trip_over_the_whole_int_range() {
+    let cases = [0, 1, 127, 128, 300, 16383, 16384, 2147483647, -1, -2, -2147483648, math.MAX_INT, math.MIN_INT];
+    for v in cases {
+        assert_eq_msg(read_back(varint_bytes(v)), v, "varint ${v}");
+    }
+    assert_eq(varint_bytes(300), bytes_of([0xAC, 0x02]));
+    // A negative value is its 64-bit two's complement: always 10 octets.
+    assert_eq(varint_bytes(-1).len(), 10);
+    assert_eq(varint_bytes(-1), bytes_of([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]));
+}
+
+@test
+fn zigzag_maps_signed_to_unsigned() {
+    assert_eq(wire.zigzag(0), 0);
+    assert_eq(wire.zigzag(-1), 1);
+    assert_eq(wire.zigzag(1), 2);
+    assert_eq(wire.zigzag(-2), 3);
+    assert_eq(wire.zigzag(2147483647), 4294967294);
+    assert_eq(wire.zigzag(-2147483648), 4294967295);
+    for v in [0, 1, -1, 63, -64, math.MAX_INT, math.MIN_INT] {
+        assert_eq(wire.unzigzag(wire.zigzag(v)), v);
+    }
+}
+
+@test
+fn int32_views_truncate_like_the_wire() {
+    assert_eq(wire.to_i32(4294967295), -1);
+    assert_eq(wire.to_i32(-1), -1);
+    assert_eq(wire.to_u32(-1), 4294967295);
+    assert_eq(wire.to_i32(2147483648), -2147483648);
+}
+
+@test
+fn binary32_bits_match_known_vectors() {
+    assert_eq(wire.f32_bits(1.0), 0x3F80_0000);
+    assert_eq(wire.f32_bits(-2.0), 0xC000_0000);
+    assert_eq(wire.f32_bits(0.1), 0x3DCC_CCCD);
+    assert_eq(wire.f32_bits(0.0), 0);
+    assert_eq(wire.f32_bits(math.float_from_bits(math.MIN_INT)), 0x8000_0000);
+    assert_eq(wire.f32_bits(3.4028234663852886e38), 0x7F7F_FFFF);
+    assert_eq(wire.f32_bits(1e39), 0x7F80_0000);
+    assert_eq(wire.f32_bits(-1e39), 0xFF80_0000);
+    // The smallest subnormal and a value that rounds to it.
+    assert_eq(wire.f32_bits(1.401298464324817e-45), 1);
+    assert_eq(wire.f32_bits(1e-46), 0);
+    assert_eq(wire.f32_bits(1.1754943508222875e-38), 0x0080_0000);
+    // Ties to even: 1 + 2^-24 lies halfway between 1 and the next binary32.
+    assert_eq(wire.f32_bits(1.0000000596046448), 0x3F80_0000);
+    assert_eq(wire.f32_bits(1.0000001788139343), 0x3F80_0002);
+    let nan = wire.f32_bits(math.float_from_bits(0x7FF8_0000_0000_0000));
+    assert_eq(nan & 0x7F80_0000, 0x7F80_0000);
+    assert((nan & 0x007F_FFFF) != 0);
+}
+
+@test
+fn binary32_from_bits_inverts() {
+    for bits in [0x3F80_0000, 0x3DCC_CCCD, 0xC000_0000, 1, 0x0080_0000, 0x7F7F_FFFF, 0x8000_0000] {
+        assert_eq_msg(wire.f32_bits(wire.f32_from_bits(bits)), bits, "bits ${bits}");
+    }
+    assert_eq(wire.f32_from_bits(0x3F80_0000), 1.0);
+    assert_eq(wire.f32_from_bits(0x7F80_0000), math.float_from_bits(0x7FF0_0000_0000_0000));
+    let nan = wire.f32_from_bits(0x7FC0_0000);
+    assert(nan != nan);
+}
+
+@test
+fn fixed_fields_are_little_endian() {
+    let w = wire.writer();
+    wire.write_fixed32(w, 1, 0x0102_0304);
+    wire.write_fixed64(w, 2, -2);
+    let b = wire.finish(w);
+    assert_eq(b, bytes_of([0x0D, 4, 3, 2, 1, 0x11, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]));
+    let fields = wire.parse_raw(b).unwrap();
+    match (fields[0].value) {
+        wire.Raw.Fixed32(n) => assert_eq(n, 0x0102_0304),
+        _ => panic("expected fixed32"),
+    }
+    match (fields[1].value) {
+        wire.Raw.Fixed64(n) => assert_eq(n, -2),
+        _ => panic("expected fixed64"),
+    }
+}
+
+fn is_err(b: [int]) -> bool {
+    wire.parse_raw(bytes_of(b)).is_err()
+}
+
+@test
+fn malformed_input_is_an_error_never_a_panic() {
+    assert(is_err([0x08, 0x80]));
+    assert(is_err([0x80]));
+    assert(is_err([0x09, 0x01, 0x02]));
+    assert(is_err([0x0D, 0x01]));
+    assert(is_err([0x0A, 0x05, 0x41]));
+    assert(is_err([0x0A, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F]));
+    // Field number 0, wire types 6 and 7, an 11-octet varint, a stray end-group.
+    assert(is_err([0x00, 0x01]));
+    assert(is_err([0x0E, 0x01]));
+    assert(is_err([0x0F, 0x01]));
+    assert(is_err([0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]));
+    assert(is_err([0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02]));
+    assert(is_err([0x0C]));
+    assert(is_err([0x0B, 0x08, 0x01]));
+}
+
+@test
+fn groups_are_parsed_and_skipped() {
+    // field 1 group { field 2 varint 5 } end-group, then field 3 varint 7
+    let b = bytes_of([0x0B, 0x10, 0x05, 0x0C, 0x18, 0x07]);
+    let fields = wire.parse_raw(b).unwrap();
+    assert_eq(fields.len(), 2);
+    match (fields[0].value) {
+        wire.Raw.Group(inner) => assert_eq(inner.len(), 1),
+        _ => panic("expected a group"),
+    }
+    let r = wire.reader(b);
+    let t = wire.read_tag(r).unwrap();
+    wire.skip(r, t).unwrap();
+    assert_eq(wire.read_tag(r).unwrap().field, 3);
+}
+
+@test
+fn packed_runs_unpack() {
+    let w = wire.writer();
+    wire.write_packed_varints(w, 4, [3, 270, 86942]);
+    let b = wire.finish(w);
+    // The protobuf documentation's own example.
+    assert_eq(b, bytes_of([0x22, 0x06, 0x03, 0x8E, 0x02, 0x9E, 0xA7, 0x05]));
+    let body = wire.read_len_delim(wire.reader(b.sub_bytes(1, b.len()))).unwrap();
+    assert_eq(wire.unpack_varints(body).unwrap(), [3, 270, 86942]);
+    assert(wire.unpack_fixed32(bytes_of([1, 2, 3])).is_err());
+}
+
+@test
+fn std_protobuf_agrees_on_well_formed_messages() {
+    // Differential: std/protobuf.parse and wire.parse_raw see the same fields.
+    let w = protobuf.writer();
+    w.write_varint(1, 150);
+    w.write_string(2, "testing");
+    w.write_fixed64(3, 77);
+    w.write_fixed32(4, 9);
+    w.write_bytes(5, bytes_of([1, 2]));
+    let b = w.finish();
+    let theirs = protobuf.parse(b).unwrap();
+    let ours = wire.parse_raw(b).unwrap();
+    assert_eq(theirs.len(), ours.len());
+    for i in 0..ours.len() {
+        assert_eq(theirs[i].number, ours[i].field);
+        match (ours[i].value) {
+            wire.Raw.Varint(n) => assert_eq(theirs[i].int_val, n),
+            wire.Raw.Fixed64(n) => assert_eq(theirs[i].int_val, n),
+            wire.Raw.Fixed32(n) => assert_eq(theirs[i].int_val, n),
+            wire.Raw.Bytes(x) => assert_eq(theirs[i].bytes_val, x),
+            wire.Raw.Group(_) => panic("no groups here"),
+        }
+    }
+    // And our writer's bytes for the same fields are identical.
+    let ow = wire.writer();
+    wire.write_int(ow, 1, 150);
+    wire.write_string(ow, 2, "testing");
+    wire.write_fixed64(ow, 3, 77);
+    wire.write_fixed32(ow, 4, 9);
+    wire.write_bytes(ow, 5, bytes_of([1, 2]));
+    assert_eq(wire.finish(ow), b);
+}

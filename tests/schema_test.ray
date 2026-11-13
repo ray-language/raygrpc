@@ -1,0 +1,143 @@
+// The .proto parser and the descriptor codec, against protoc's own descriptor sets
+// (tests/fixtures/*.pb, made by scripts/fixtures.sh).
+
+import descriptor;
+import loader;
+import proto_parser;
+import schema;
+import std/fs;
+
+fn demo() -> schema.Registry {
+    loader.demo_registry().unwrap()
+}
+
+@test
+fn the_demo_protos_parse_and_resolve() {
+    let reg = demo();
+    assert_eq(schema.service_names(reg), ["grpc.reflection.v1.ServerReflection", "raygrpc.demo.Echo", "raygrpc.demo.Greeter", "raygrpc.demo.KeyValue"]);
+    let m = schema.message(reg, "raygrpc.demo.Everything").unwrap();
+    assert_eq(m.fields.len(), 30);
+    let point = schema.field_by_json(m, "point").unwrap();
+    assert_eq(point.kind, schema.T_MESSAGE);
+    assert_eq(point.type_name, ".raygrpc.common.Point");
+    let mode = schema.field_by_json(schema.message(reg, ".raygrpc.demo.Everything.Nested").unwrap(), "mode").unwrap();
+    assert_eq(mode.kind, schema.T_ENUM);
+    assert_eq(mode.type_name, ".raygrpc.demo.Everything.Nested.Mode");
+    // map<string, int64> counters → repeated CountersEntry { key = 1; value = 2; }
+    let counters = schema.field_by_json(m, "counters").unwrap();
+    assert_eq(counters.label, schema.L_REPEATED);
+    let entry = schema.message(reg, counters.type_name).unwrap();
+    assert(entry.map_entry);
+    assert_eq(entry.name, "CountersEntry");
+    // A oneof and the synthetic oneof of a proto3 optional, after the real one.
+    assert_eq(m.oneofs, ["choice", "_maybe"]);
+    let maybe = schema.field_by_json(m, "maybe").unwrap();
+    assert(maybe.proto3_optional);
+    assert_eq(maybe.oneof_index, 1);
+    assert_eq(schema.field_by_json(m, "f_uint64").unwrap().json_name, "fUint64");
+    let (svc, method) = schema.method(reg, "raygrpc.demo.Echo/Roundtrip").unwrap();
+    assert_eq(svc.full_name, "raygrpc.demo.Echo");
+    assert_eq(method.input_type, ".raygrpc.demo.Everything");
+    let (_, info) = schema.method(reg, "grpc.reflection.v1.ServerReflection.ServerReflectionInfo").unwrap();
+    assert(info.client_streaming && info.server_streaming);
+}
+
+@test
+fn descriptors_are_byte_identical_to_protoc() {
+    let reg = demo();
+    let ours = descriptor.encode_set([reg.files.get("demo.proto").unwrap()]);
+    assert_eq(ours, fs.read_file_bytes("tests/fixtures/demo.pb").unwrap());
+    var all: [schema.FileDef] = [];
+    for n in ["common.proto", "demo.proto", "grpc/reflection/v1/reflection.proto"] {
+        all.push(reg.files.get(n).unwrap());
+    }
+    assert_eq(descriptor.encode_set(all), fs.read_file_bytes("tests/fixtures/all.pb").unwrap());
+}
+
+@test
+fn protoc_descriptor_sets_decode_and_re_encode() {
+    let raw = fs.read_file_bytes("tests/fixtures/all.pb").unwrap();
+    let files = descriptor.decode_set(raw).unwrap();
+    assert_eq(files.len(), 3);
+    assert_eq(descriptor.encode_set(files), raw);
+    let reg = descriptor.registry_of(files);
+    let m = schema.message(reg, "raygrpc.demo.Everything.Nested.Inner").unwrap();
+    assert_eq(m.fields[0].name, "flags");
+    assert(schema.message(reg, "raygrpc.demo.Everything.PointsByIdEntry").unwrap().map_entry);
+    assert_eq(schema.file_closure(reg, "demo.proto"), ["common.proto", "demo.proto"]);
+}
+
+fn parse_err(src: string) -> string {
+    match (proto_parser.load(proto_parser.from_memory([("t.proto", src)]), ["t.proto"])) {
+        Result.Ok(_) => "",
+        Result.Err(e) => e,
+    }
+}
+
+@test
+fn parse_errors_say_where() {
+    assert(parse_err("syntax = \"proto3\";\nmessage A { Missing m = 1; }").contains("type Missing is not defined"));
+    assert(parse_err("syntax = \"proto2\";").contains("only proto3"));
+    assert(parse_err("message A {}").contains("missing 'syntax"));
+    assert(parse_err("syntax = \"proto3\";\nmessage A {\n  int32 x = ;\n}").contains("t.proto:3"));
+    assert(parse_err("syntax = \"proto3\";\nmessage A { required int32 x = 1; }").contains("required"));
+    assert(parse_err("syntax = \"proto3\";\n/* never closed").contains("unterminated comment"));
+}
+
+@test
+fn imports_resolve_and_cycles_are_caught() {
+    let files = [
+        ("a.proto", "syntax = \"proto3\"; package p; import \"b.proto\"; message A { q.B b = 1; }"),
+        ("b.proto", "syntax = \"proto3\"; package q; message B { int32 n = 1; }"),
+    ];
+    let reg = proto_parser.load(proto_parser.from_memory(files), ["a.proto"]).unwrap();
+    assert_eq(schema.message(reg, "p.A").unwrap().fields[0].type_name, ".q.B");
+    let cyc = [
+        ("x.proto", "syntax = \"proto3\"; import \"y.proto\";"),
+        ("y.proto", "syntax = \"proto3\"; import \"x.proto\";"),
+    ];
+    match (proto_parser.load(proto_parser.from_memory(cyc), ["x.proto"])) {
+        Result.Ok(_) => panic("a cycle must fail"),
+        Result.Err(e) => assert(e.contains("import cycle")),
+    }
+    // A type from a file that is not imported is not visible.
+    let hidden = [
+        ("a.proto", "syntax = \"proto3\"; package p; import \"b.proto\"; message A { C c = 1; }"),
+        ("b.proto", "syntax = \"proto3\"; package p; import \"c.proto\";"),
+        ("c.proto", "syntax = \"proto3\"; package p; message C {}"),
+    ];
+    assert(proto_parser.load(proto_parser.from_memory(hidden), ["a.proto"]).is_err());
+}
+
+@test
+fn scoping_finds_the_innermost_declaration() {
+    let src = `syntax = "proto3";
+package a.b;
+message T { int32 outer = 1; }
+message M {
+  message T { string inner = 1; }
+  T t = 1;          // M.T, the inner one
+  .a.b.T top = 2;   // fully qualified
+  b.T rel = 3;      // a.b.T through the package
+  // comments, options and reserved ranges are accepted
+  reserved 9, 10 to 12;
+  option deprecated = true;
+  int32 x = 4 [deprecated = true, json_name = "ex"];
+}
+enum E { option allow_alias = true; Z = 0; ZERO = 0; }`;
+    let reg = proto_parser.load(proto_parser.from_memory([("s.proto", src)]), ["s.proto"]).unwrap();
+    let m = schema.message(reg, "a.b.M").unwrap();
+    assert_eq(m.fields[0].type_name, ".a.b.M.T");
+    assert_eq(m.fields[1].type_name, ".a.b.T");
+    assert_eq(m.fields[2].type_name, ".a.b.T");
+    assert_eq(m.fields[3].json_name, "ex");
+    assert(schema.enum_def(reg, "a.b.E").unwrap().allow_alias);
+}
+
+@test
+fn json_names_follow_protoc() {
+    assert_eq(schema.json_name_of("foo_bar"), "fooBar");
+    assert_eq(schema.json_name_of("foo_bar_baz2"), "fooBarBaz2");
+    assert_eq(schema.json_name_of("_x"), "X");
+    assert_eq(schema.json_name_of("already"), "already");
+}

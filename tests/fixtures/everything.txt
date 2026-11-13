@@ -1,0 +1,28 @@
+f_double: -2.5
+f_float: 0.1
+f_int32: -7
+f_int64: -9000000000
+f_uint32: 4294967295
+f_uint64: 18446744073709551615
+f_sint32: -2147483648
+f_sint64: -9223372036854775808
+f_fixed32: 4000000000
+f_fixed64: 18446744073709551000
+f_sfixed32: -5
+f_sfixed64: -6
+f_bool: true
+f_string: "héllo\n\"x\""
+f_bytes: "\000\001\377abc"
+level: HIGH
+point { x: -3 y: 4 }
+packed_ints: [1, -1, 300]
+packed_sints: [-1, 1, -64]
+packed_doubles: [1.5, -0.0]
+unpacked_fixed: [1, 2]
+names: ["a", "b"]
+path { x: 1 } path { y: 2 }
+counters { key: "k" value: -1 }
+points_by_id { key: 7 value { x: 1 } }
+nested_choice { label: "n" inner { flags: [true, false] } mode: SAFE }
+maybe: 0
+nested { label: "deep" }

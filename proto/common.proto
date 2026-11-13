@@ -1,0 +1,15 @@
+// Shared types of the raygrpc demo, imported by demo.proto.
+syntax = "proto3";
+
+package raygrpc.common;
+
+message Point {
+  sint32 x = 1;
+  sint32 y = 2;
+}
+
+enum Level {
+  LEVEL_UNSPECIFIED = 0;
+  LOW = 1;
+  HIGH = 2;
+}

@@ -1,0 +1,786 @@
+//! A parser for the proto3 subset that gRPC services use: `syntax`, `package`, `import`
+//! (searched on import paths), messages with nested messages and enums, `repeated`,
+//! `optional`, `map<K, V>`, `oneof`, enums, services with (streaming) rpcs, and options
+//! (only `packed`, `json_name` and `allow_alias` change anything; the rest are skipped).
+//! Type names are resolved with protobuf's scoping rules once every file is loaded.
+
+import schema;
+import std/fs;
+
+// ---- tokens ----
+
+enum Tok {
+    Ident(string),
+    Int(string),
+    Str(string),
+    Sym(char),
+    End,
+}
+
+struct Token {
+    tok: Tok,
+    line: int,
+}
+
+fn is_ident_start(c: char) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+}
+
+fn is_ident_char(c: char) -> bool {
+    is_ident_start(c) || (c >= '0' && c <= '9') || c == '.'
+}
+
+fn is_digit(c: char) -> bool {
+    c >= '0' && c <= '9'
+}
+
+fn tokenize(src: string, file: string) -> Result<[Token], string> {
+    let cs = src.chars();
+    let n = cs.len();
+    var out: [Token] = [];
+    var i = 0;
+    var line = 1;
+    while (i < n) {
+        let c = cs[i];
+        if (c == '\n') {
+            line = line + 1;
+            i = i + 1;
+        } else if (c == ' ' || c == '\t' || c == '\r') {
+            i = i + 1;
+        } else if (c == '/' && i + 1 < n && cs[i + 1] == '/') {
+            while (i < n && cs[i] != '\n') {
+                i = i + 1;
+            }
+        } else if (c == '/' && i + 1 < n && cs[i + 1] == '*') {
+            i = i + 2;
+            while (i + 1 < n && !(cs[i] == '*' && cs[i + 1] == '/')) {
+                if (cs[i] == '\n') {
+                    line = line + 1;
+                }
+                i = i + 1;
+            }
+            if (i + 1 >= n) {
+                return Result.Err("${file}:${line}: unterminated comment");
+            }
+            i = i + 2;
+        } else if (is_ident_start(c) || (c == '.' && i + 1 < n && is_ident_start(cs[i + 1]))) {
+            let start = i;
+            while (i < n && is_ident_char(cs[i])) {
+                i = i + 1;
+            }
+            out.push(Token { tok: Tok.Ident(cs.chars_to_string(start, i)), line: line });
+        } else if (is_digit(c) || ((c == '-' || c == '+') && i + 1 < n && is_digit(cs[i + 1]))) {
+            let start = i;
+            i = i + 1;
+            while (i < n && (is_ident_char(cs[i]) || ((cs[i] == '-' || cs[i] == '+') && (cs[i - 1] == 'e' || cs[i - 1] == 'E')))) {
+                i = i + 1;
+            }
+            out.push(Token { tok: Tok.Int(cs.chars_to_string(start, i)), line: line });
+        } else if (c == '"' || c == '\'') {
+            let quote = c;
+            i = i + 1;
+            var s = "";
+            while (i < n && cs[i] != quote) {
+                if (cs[i] == '\\' && i + 1 < n) {
+                    i = i + 1;
+                    let e = cs[i];
+                    s = s + match (e) {
+                        'n' => "\n",
+                        't' => "\t",
+                        'r' => "\r",
+                        _ => to_string(e),
+                    };
+                } else {
+                    if (cs[i] == '\n') {
+                        return Result.Err("${file}:${line}: newline in a string");
+                    }
+                    s = s + to_string(cs[i]);
+                }
+                i = i + 1;
+            }
+            if (i >= n) {
+                return Result.Err("${file}:${line}: unterminated string");
+            }
+            i = i + 1;
+            out.push(Token { tok: Tok.Str(s), line: line });
+        } else if ("{}[]()<>;=,:".contains(to_string(c))) {
+            out.push(Token { tok: Tok.Sym(c), line: line });
+            i = i + 1;
+        } else {
+            return Result.Err("${file}:${line}: unexpected character '${c}'");
+        }
+    }
+    out.push(Token { tok: Tok.End, line: line });
+    Result.Ok(out)
+}
+
+// ---- parser ----
+
+struct Parser {
+    toks: [Token],
+    pos: int,
+    file: string,
+}
+
+fn peek(p: Parser) -> Tok {
+    p.toks[p.pos].tok
+}
+
+fn here(p: Parser) -> string {
+    "${p.file}:${p.toks[p.pos].line}"
+}
+
+fn advance(p: Parser) -> Tok {
+    let t = p.toks[p.pos].tok;
+    if (p.pos < p.toks.len() - 1) {
+        p.pos = p.pos + 1;
+    }
+    t
+}
+
+fn describe(t: Tok) -> string {
+    match (t) {
+        Tok.Ident(s) => "'${s}'",
+        Tok.Int(s) => "'${s}'",
+        Tok.Str(s) => "\"${s}\"",
+        Tok.Sym(c) => "'${c}'",
+        Tok.End => "end of file",
+    }
+}
+
+fn is_sym(p: Parser, c: char) -> bool {
+    match (peek(p)) {
+        Tok.Sym(x) => x == c,
+        _ => false,
+    }
+}
+
+fn is_word(p: Parser, w: string) -> bool {
+    match (peek(p)) {
+        Tok.Ident(x) => x == w,
+        _ => false,
+    }
+}
+
+fn expect_sym(p: Parser, c: char) -> Result<int, string> {
+    if (is_sym(p, c)) {
+        advance(p);
+        return Result.Ok(0);
+    }
+    Result.Err("${here(p)}: expected '${c}', found ${describe(peek(p))}")
+}
+
+fn ident(p: Parser) -> Result<string, string> {
+    let at = here(p);
+    match (advance(p)) {
+        Tok.Ident(s) => Result.Ok(s),
+        t => Result.Err("${at}: expected a name, found ${describe(t)}"),
+    }
+}
+
+fn string_lit(p: Parser) -> Result<string, string> {
+    var s = "";
+    var any = false;
+    while (true) {
+        match (peek(p)) {
+            Tok.Str(x) => {
+                advance(p);
+                s = s + x;
+                any = true;
+            },
+            _ => break,
+        }
+    }
+    if (!any) {
+        return Result.Err("${here(p)}: expected a string, found ${describe(peek(p))}");
+    }
+    Result.Ok(s)
+}
+
+fn parse_int_lit(p: Parser, text: string) -> Result<int, string> {
+    var neg = false;
+    var t = text;
+    if (t.starts_with("-")) {
+        neg = true;
+        t = t.substring(1, t.len());
+    } else if (t.starts_with("+")) {
+        t = t.substring(1, t.len());
+    }
+    var v = 0;
+    if (t.starts_with("0x") || t.starts_with("0X")) {
+        for c in t.substring(2, t.len()).to_lower().chars() {
+            let d = "0123456789abcdef".index_of(to_string(c));
+            match (d) {
+                Option.Some(x) => v = v * 16 + x,
+                Option.None => return Result.Err("${here(p)}: bad number ${text}"),
+            }
+        }
+    } else if (t.len() > 1 && t.starts_with("0")) {
+        for c in t.substring(1, t.len()).chars() {
+            if (c < '0' || c > '7') {
+                return Result.Err("${here(p)}: bad octal number ${text}");
+            }
+            v = v * 8 + (char_code(c) - 48);
+        }
+    } else {
+        match (parse_int(t)) {
+            Option.Some(x) => v = x,
+            Option.None => return Result.Err("${here(p)}: bad number ${text}"),
+        }
+    }
+    Result.Ok(if (neg) { 0 - v } else { v })
+}
+
+fn int_value(p: Parser) -> Result<int, string> {
+    let at = here(p);
+    match (advance(p)) {
+        Tok.Int(s) => parse_int_lit(p, s),
+        t => Result.Err("${at}: expected a number, found ${describe(t)}"),
+    }
+}
+
+/// An option value: a constant, or an aggregate `{ … }` (skipped).
+fn option_value(p: Parser) -> Result<string, string> {
+    if (is_sym(p, '{')) {
+        var depth = 0;
+        while (true) {
+            match (advance(p)) {
+                Tok.Sym(c) => {
+                    if (c == '{') {
+                        depth = depth + 1;
+                    } else if (c == '}') {
+                        depth = depth - 1;
+                        if (depth == 0) {
+                            return Result.Ok("");
+                        }
+                    }
+                },
+                Tok.End => return Result.Err("${here(p)}: unterminated option aggregate"),
+                _ => {},
+            }
+        }
+    }
+    match (advance(p)) {
+        Tok.Ident(s) => Result.Ok(s),
+        Tok.Int(s) => Result.Ok(s),
+        Tok.Str(s) => {
+            var acc = s;
+            while (true) {
+                match (peek(p)) {
+                    Tok.Str(x) => {
+                        advance(p);
+                        acc = acc + x;
+                    },
+                    _ => break,
+                }
+            }
+            Result.Ok(acc)
+        },
+        t => Result.Err("${here(p)}: expected an option value, found ${describe(t)}"),
+    }
+}
+
+/// An option name: `foo`, `(my.ext)`, `(my.ext).sub`.
+fn option_name(p: Parser) -> Result<string, string> {
+    var name = "";
+    if (is_sym(p, '(')) {
+        advance(p);
+        name = "(" + ident(p)? + ")";
+        expect_sym(p, ')')?;
+        match (peek(p)) {
+            Tok.Ident(s) => {
+                if (s.starts_with(".")) {
+                    advance(p);
+                    name = name + s;
+                }
+            },
+            _ => {},
+        }
+        return Result.Ok(name);
+    }
+    ident(p)
+}
+
+/// `option name = value;` (the `option` keyword already consumed).
+fn option_stmt(p: Parser) -> Result<(string, string), string> {
+    let name = option_name(p)?;
+    expect_sym(p, '=')?;
+    let v = option_value(p)?;
+    expect_sym(p, ';')?;
+    Result.Ok((name, v))
+}
+
+/// `[a = 1, b = "x"]` after a field or enum value.
+fn field_options(p: Parser) -> Result<[(string, string)], string> {
+    var out: [(string, string)] = [];
+    if (!is_sym(p, '[')) {
+        return Result.Ok(out);
+    }
+    advance(p);
+    while (true) {
+        let name = option_name(p)?;
+        expect_sym(p, '=')?;
+        let v = option_value(p)?;
+        out.push((name, v));
+        if (is_sym(p, ',')) {
+            advance(p);
+        } else {
+            break;
+        }
+    }
+    expect_sym(p, ']')?;
+    Result.Ok(out)
+}
+
+/// `reserved 1, 2 to 5;` or `reserved "a", "b";` — parsed and dropped.
+fn skip_statement(p: Parser) -> Result<int, string> {
+    while (!is_sym(p, ';')) {
+        match (advance(p)) {
+            Tok.End => return Result.Err("${here(p)}: expected ';'"),
+            _ => {},
+        }
+    }
+    advance(p);
+    Result.Ok(0)
+}
+
+fn camel_upper(name: string) -> string {
+    let j = schema.json_name_of(name);
+    if (j.len() == 0) {
+        return j;
+    }
+    to_string(j[0]).to_upper() + j.substring(1, j.len())
+}
+
+fn new_field(name: string, number: int, label: int, type_word: string) -> schema.FieldDef {
+    schema.FieldDef {
+        name: name,
+        number: number,
+        label: label,
+        kind: schema.scalar_kind(type_word),
+        type_name: if (schema.scalar_kind(type_word) == 0) { type_word } else { "" },
+        oneof_index: -1,
+        json_name: schema.json_name_of(name),
+        proto3_optional: false,
+        packed_off: false,
+    }
+}
+
+fn apply_field_options(f: schema.FieldDef, opts: [(string, string)]) {
+    for (k, v) in opts {
+        if (k == "packed" && v == "false") {
+            f.packed_off = true;
+        } else if (k == "json_name") {
+            f.json_name = v;
+        }
+    }
+}
+
+/// A field after its label (if any) was consumed. `label` is 0 for a plain proto3 field.
+fn field(p: Parser, msg: schema.MessageDef, label: int, oneof: int) -> Result<int, string> {
+    let type_word = ident(p)?;
+    let name = ident(p)?;
+    expect_sym(p, '=')?;
+    let number = int_value(p)?;
+    let opts = field_options(p)?;
+    expect_sym(p, ';')?;
+    let real_label = if (label == schema.L_REPEATED) { schema.L_REPEATED } else { schema.L_OPTIONAL };
+    let f = new_field(name, number, real_label, type_word);
+    f.oneof_index = oneof;
+    apply_field_options(f, opts);
+    if (label == -1) {
+        // proto3 `optional`: a synthetic oneof named "_<field>", added after the real ones.
+        f.proto3_optional = true;
+    }
+    msg.fields.push(f);
+    Result.Ok(0)
+}
+
+/// `map<K, V> name = N;` → a repeated field of a synthesized nested `NameEntry` message.
+fn map_field(p: Parser, msg: schema.MessageDef) -> Result<int, string> {
+    expect_sym(p, '<')?;
+    let k = ident(p)?;
+    expect_sym(p, ',')?;
+    let v = ident(p)?;
+    expect_sym(p, '>')?;
+    let name = ident(p)?;
+    expect_sym(p, '=')?;
+    let number = int_value(p)?;
+    let opts = field_options(p)?;
+    expect_sym(p, ';')?;
+    let entry_name = camel_upper(name) + "Entry";
+    let entry = schema.new_message(entry_name, "${msg.full_name}.${entry_name}");
+    entry.map_entry = true;
+    entry.fields.push(new_field("key", 1, schema.L_OPTIONAL, k));
+    entry.fields.push(new_field("value", 2, schema.L_OPTIONAL, v));
+    msg.nested.push(entry);
+    let f = new_field(name, number, schema.L_REPEATED, entry_name);
+    f.kind = 0;
+    f.type_name = entry_name;
+    apply_field_options(f, opts);
+    msg.fields.push(f);
+    Result.Ok(0)
+}
+
+fn enum_body(p: Parser, scope: string) -> Result<schema.EnumDef, string> {
+    let name = ident(p)?;
+    let e = schema.EnumDef { name: name, full_name: join_name(scope, name), values: [], allow_alias: false };
+    expect_sym(p, '{')?;
+    while (!is_sym(p, '}')) {
+        if (is_word(p, "option")) {
+            advance(p);
+            let (k, v) = option_stmt(p)?;
+            if (k == "allow_alias" && v == "true") {
+                e.allow_alias = true;
+            }
+        } else if (is_word(p, "reserved")) {
+            skip_statement(p)?;
+        } else if (is_sym(p, ';')) {
+            advance(p);
+        } else {
+            let vname = ident(p)?;
+            expect_sym(p, '=')?;
+            let number = int_value(p)?;
+            field_options(p)?;
+            expect_sym(p, ';')?;
+            e.values.push(schema.EnumValueDef { name: vname, number: number });
+        }
+    }
+    advance(p);
+    if (e.values.len() == 0) {
+        return Result.Err("${here(p)}: enum ${name} has no values");
+    }
+    Result.Ok(e)
+}
+
+fn join_name(scope: string, name: string) -> string {
+    if (scope == "") { name } else { "${scope}.${name}" }
+}
+
+fn message_body(p: Parser, scope: string) -> Result<schema.MessageDef, string> {
+    let name = ident(p)?;
+    let msg = schema.new_message(name, join_name(scope, name));
+    expect_sym(p, '{')?;
+    var synthetic: [string] = [];
+    while (!is_sym(p, '}')) {
+        match (peek(p)) {
+            Tok.End => return Result.Err("${here(p)}: message ${name} is not closed"),
+            _ => {},
+        }
+        if (is_word(p, "message")) {
+            advance(p);
+            msg.nested.push(message_body(p, msg.full_name)?);
+        } else if (is_word(p, "enum")) {
+            advance(p);
+            msg.enums.push(enum_body(p, msg.full_name)?);
+        } else if (is_word(p, "option")) {
+            advance(p);
+            option_stmt(p)?;
+        } else if (is_word(p, "reserved") || is_word(p, "extensions")) {
+            skip_statement(p)?;
+        } else if (is_word(p, "oneof")) {
+            advance(p);
+            let oname = ident(p)?;
+            let index = msg.oneofs.len();
+            msg.oneofs.push(oname);
+            expect_sym(p, '{')?;
+            while (!is_sym(p, '}')) {
+                if (is_word(p, "option")) {
+                    advance(p);
+                    option_stmt(p)?;
+                } else {
+                    field(p, msg, 0, index)?;
+                }
+            }
+            advance(p);
+        } else if (is_word(p, "map")) {
+            advance(p);
+            map_field(p, msg)?;
+        } else if (is_word(p, "repeated")) {
+            advance(p);
+            field(p, msg, schema.L_REPEATED, -1)?;
+        } else if (is_word(p, "optional")) {
+            advance(p);
+            field(p, msg, -1, -1)?;
+            synthetic.push(msg.fields[msg.fields.len() - 1].name);
+        } else if (is_word(p, "required")) {
+            return Result.Err("${here(p)}: 'required' is not allowed in proto3");
+        } else if (is_sym(p, ';')) {
+            advance(p);
+        } else {
+            field(p, msg, 0, -1)?;
+        }
+    }
+    advance(p);
+    // Synthetic oneofs for proto3 `optional` go after the real ones, as protoc does.
+    for fname in synthetic {
+        for f in msg.fields {
+            if (f.name == fname) {
+                f.oneof_index = msg.oneofs.len();
+                msg.oneofs.push("_${fname}");
+            }
+        }
+    }
+    Result.Ok(msg)
+}
+
+fn service_body(p: Parser, package: string) -> Result<schema.ServiceDef, string> {
+    let name = ident(p)?;
+    let svc = schema.ServiceDef { name: name, full_name: join_name(package, name), methods: [] };
+    expect_sym(p, '{')?;
+    while (!is_sym(p, '}')) {
+        if (is_word(p, "option")) {
+            advance(p);
+            option_stmt(p)?;
+        } else if (is_word(p, "rpc")) {
+            advance(p);
+            let mname = ident(p)?;
+            expect_sym(p, '(')?;
+            var cs = false;
+            if (is_word(p, "stream")) {
+                advance(p);
+                cs = true;
+            }
+            let input = ident(p)?;
+            expect_sym(p, ')')?;
+            if (!is_word(p, "returns")) {
+                return Result.Err("${here(p)}: expected 'returns'");
+            }
+            advance(p);
+            expect_sym(p, '(')?;
+            var ss = false;
+            if (is_word(p, "stream")) {
+                advance(p);
+                ss = true;
+            }
+            let output = ident(p)?;
+            expect_sym(p, ')')?;
+            if (is_sym(p, '{')) {
+                advance(p);
+                while (!is_sym(p, '}')) {
+                    if (is_word(p, "option")) {
+                        advance(p);
+                        option_stmt(p)?;
+                    } else if (is_sym(p, ';')) {
+                        advance(p);
+                    } else {
+                        return Result.Err("${here(p)}: unexpected ${describe(peek(p))} in rpc ${mname}");
+                    }
+                }
+                advance(p);
+            } else {
+                expect_sym(p, ';')?;
+            }
+            svc.methods.push(schema.MethodDef {
+                name: mname,
+                input_type: input,
+                output_type: output,
+                client_streaming: cs,
+                server_streaming: ss,
+            });
+        } else if (is_sym(p, ';')) {
+            advance(p);
+        } else {
+            return Result.Err("${here(p)}: unexpected ${describe(peek(p))} in service ${name}");
+        }
+    }
+    advance(p);
+    Result.Ok(svc)
+}
+
+/// Parses one file's text into an unresolved `FileDef` (type names as written).
+pub fn parse_file(name: string, src: string) -> Result<schema.FileDef, string> {
+    let toks = tokenize(src, name)?;
+    let p = Parser { toks: toks, pos: 0, file: name };
+    let f = schema.new_file(name);
+    f.syntax = "";
+    while (true) {
+        match (peek(p)) {
+            Tok.End => break,
+            _ => {},
+        }
+        if (is_word(p, "syntax") || is_word(p, "edition")) {
+            let word = ident(p)?;
+            expect_sym(p, '=')?;
+            let v = string_lit(p)?;
+            expect_sym(p, ';')?;
+            if (word == "edition" || v != "proto3") {
+                return Result.Err("${name}: only proto3 is supported (found ${word} = \"${v}\")");
+            }
+            f.syntax = v;
+        } else if (is_word(p, "package")) {
+            advance(p);
+            f.package = ident(p)?;
+            expect_sym(p, ';')?;
+        } else if (is_word(p, "import")) {
+            advance(p);
+            if (is_word(p, "public") || is_word(p, "weak")) {
+                advance(p);
+            }
+            f.dependencies.push(string_lit(p)?);
+            expect_sym(p, ';')?;
+        } else if (is_word(p, "option")) {
+            advance(p);
+            option_stmt(p)?;
+        } else if (is_word(p, "message")) {
+            advance(p);
+            f.messages.push(message_body(p, f.package)?);
+        } else if (is_word(p, "enum")) {
+            advance(p);
+            f.enums.push(enum_body(p, f.package)?);
+        } else if (is_word(p, "service")) {
+            advance(p);
+            f.services.push(service_body(p, f.package)?);
+        } else if (is_sym(p, ';')) {
+            advance(p);
+        } else {
+            return Result.Err("${here(p)}: unexpected ${describe(peek(p))} at top level");
+        }
+    }
+    if (f.syntax == "") {
+        return Result.Err("${name}: missing 'syntax = \"proto3\";' (proto2 is not supported)");
+    }
+    Result.Ok(f)
+}
+
+// ---- loading and resolution ----
+
+/// Where to read files from: a directory list, or in-memory sources (tests, embedded protos).
+pub struct Source {
+    import_paths: [string],
+    memory: Map<string, string>,
+}
+
+pub fn from_dirs(import_paths: [string]) -> Source {
+    let memory: Map<string, string> = Map.new();
+    Source { import_paths: import_paths, memory: memory }
+}
+
+pub fn from_memory(files: [(string, string)]) -> Source {
+    let memory: Map<string, string> = Map.new();
+    for (k, v) in files {
+        memory.insert(k, v);
+    }
+    Source { import_paths: [], memory: memory }
+}
+
+fn read_source(src: Source, name: string) -> Result<string, string> {
+    match (src.memory.get(name)) {
+        Option.Some(t) => return Result.Ok(t),
+        Option.None => {},
+    }
+    for dir in src.import_paths {
+        let path = if (dir == "" || dir == ".") { name } else { "${dir}/${name}" };
+        if (fs.exists(path)) {
+            return fs.read_file(path);
+        }
+    }
+    Result.Err("${name}: file not found (import paths: ${src.import_paths.join(", ")})")
+}
+
+/// Loads `names` and everything they import into a new registry, resolving every type name.
+pub fn load(src: Source, names: [string]) -> Result<schema.Registry, string> {
+    let reg = schema.registry();
+    var stack: [string] = [];
+    for n in names {
+        load_one(src, reg, n, stack)?;
+    }
+    for fname in reg.file_order {
+        let f = reg.files.get(fname).unwrap();
+        resolve_file(reg, f)?;
+    }
+    Result.Ok(reg)
+}
+
+fn load_one(src: Source, reg: schema.Registry, name: string, stack: [string]) -> Result<int, string> {
+    if (reg.files.contains_key(name)) {
+        return Result.Ok(0);
+    }
+    if (stack.contains(name)) {
+        return Result.Err("import cycle: ${stack.join(" -> ")} -> ${name}");
+    }
+    let text = read_source(src, name)?;
+    let f = parse_file(name, text)?;
+    stack.push(name);
+    for d in f.dependencies {
+        load_one(src, reg, d, stack)?;
+    }
+    stack.pop();
+    schema.add_file(reg, f);
+    Result.Ok(0)
+}
+
+/// The files `f` can see: itself and its direct imports (public re-exports not followed).
+fn visible(reg: schema.Registry, f: schema.FileDef) -> [string] {
+    [f.name] + f.dependencies
+}
+
+/// Resolves a type name used inside `scope` (a fully-qualified message name or package).
+fn resolve_name(reg: schema.Registry, files: [string], scope: string, name: string) -> Result<(string, int), string> {
+    if (name.starts_with(".")) {
+        return lookup(reg, files, name.substring(1, name.len()));
+    }
+    var s = scope;
+    while (true) {
+        let candidate = join_name(s, name);
+        match (lookup(reg, files, candidate)) {
+            Result.Ok(x) => return Result.Ok(x),
+            Result.Err(_) => {},
+        }
+        if (s == "") {
+            break;
+        }
+        s = match (s.last_index_of(".")) {
+            Option.Some(i) => s.substring(0, i),
+            Option.None => "",
+        };
+    }
+    Result.Err("type ${name} is not defined (seen from ${scope})")
+}
+
+fn lookup(reg: schema.Registry, files: [string], full: string) -> Result<(string, int), string> {
+    let in_scope = match (schema.file_of_symbol(reg, full)) {
+        Option.Some(file) => files.contains(file),
+        Option.None => false,
+    };
+    if (in_scope && reg.messages.contains_key(full)) {
+        return Result.Ok((".${full}", schema.T_MESSAGE));
+    }
+    if (in_scope && reg.enums.contains_key(full)) {
+        return Result.Ok((".${full}", schema.T_ENUM));
+    }
+    Result.Err("not found")
+}
+
+fn resolve_message(reg: schema.Registry, files: [string], m: schema.MessageDef) -> Result<int, string> {
+    for f in m.fields {
+        if (f.kind == 0) {
+            let (full, kind) = resolve_name(reg, files, m.full_name, f.type_name)?;
+            f.type_name = full;
+            f.kind = kind;
+        }
+    }
+    for n in m.nested {
+        resolve_message(reg, files, n)?;
+    }
+    Result.Ok(0)
+}
+
+fn resolve_file(reg: schema.Registry, f: schema.FileDef) -> Result<int, string> {
+    let files = visible(reg, f);
+    for m in f.messages {
+        resolve_message(reg, files, m)?;
+    }
+    for s in f.services {
+        for m in s.methods {
+            let (input, ik) = resolve_name(reg, files, f.package, m.input_type)?;
+            let (output, ok) = resolve_name(reg, files, f.package, m.output_type)?;
+            if (ik != schema.T_MESSAGE || ok != schema.T_MESSAGE) {
+                return Result.Err("${f.name}: rpc ${s.name}.${m.name} must take and return messages");
+            }
+            m.input_type = input;
+            m.output_type = output;
+        }
+    }
+    Result.Ok(0)
+}

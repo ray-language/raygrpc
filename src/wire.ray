@@ -1,0 +1,539 @@
+//! The protobuf wire format, total in both directions.
+//!
+//! std/protobuf covers the happy path (non-negative varints, strings, fixed fields, a
+//! schema-less `parse`), but it panics on negative varints when writing and on truncated
+//! input when reading, has no zigzag, no packed repeated fields, no float/double and no
+//! way to write a bare varint. This module fills those gaps: a `Writer` that encodes every
+//! scalar type of proto3, a `Reader` that never panics (every malformed input is an `Err`),
+//! and the `Message` trait that typed messages implement to get `encode`/`decode` for free.
+
+import std/collections/bytesbuilder;
+import std/math;
+
+/// Wire types (the low 3 bits of a tag).
+pub const VARINT: int = 0;
+pub const I64: int = 1;
+pub const LEN: int = 2;
+pub const SGROUP: int = 3;
+pub const EGROUP: int = 4;
+pub const I32: int = 5;
+
+/// The largest field number protobuf allows (2^29 - 1).
+pub const MAX_FIELD: int = 536870911;
+
+/// An encoder. Fields are appended in call order; encoding in field-number order (what
+/// protoc does) is the caller's job.
+pub struct Writer {
+    buf: bytesbuilder.BytesBuilder,
+}
+
+pub fn writer() -> Writer {
+    Writer { buf: bytesbuilder.new() }
+}
+
+pub fn finish(w: Writer) -> bytes {
+    bytesbuilder.build(w.buf)
+}
+
+pub fn size(w: Writer) -> int {
+    bytesbuilder.len(w.buf)
+}
+
+/// A bare varint: the 64-bit two's complement value, so a negative int takes 10 octets
+/// (what int32/int64 do on the wire).
+pub fn put_varint(w: Writer, value: int) {
+    var v = value;
+    if (v < 0) {
+        bytesbuilder.push_byte(w.buf, (v & 0x7F) | 0x80);
+        // A logical shift: after one step the value is non-negative.
+        v = (v >> 7) & 0x01FF_FFFF_FFFF_FFFF;
+    }
+    while (v >= 0x80) {
+        bytesbuilder.push_byte(w.buf, (v & 0x7F) | 0x80);
+        v = v >> 7;
+    }
+    bytesbuilder.push_byte(w.buf, v);
+}
+
+pub fn put_tag(w: Writer, field: int, wire: int) {
+    put_varint(w, (field << 3) | wire);
+}
+
+pub fn put_fixed32(w: Writer, value: int) {
+    for i in 0..4 {
+        bytesbuilder.push_byte(w.buf, (value >> (8 * i)) & 0xFF);
+    }
+}
+
+pub fn put_fixed64(w: Writer, value: int) {
+    for i in 0..8 {
+        bytesbuilder.push_byte(w.buf, (value >> (8 * i)) & 0xFF);
+    }
+}
+
+pub fn put_raw(w: Writer, b: bytes) {
+    bytesbuilder.push(w.buf, b);
+}
+
+pub fn put_len_delim(w: Writer, b: bytes) {
+    put_varint(w, b.len());
+    bytesbuilder.push(w.buf, b);
+}
+
+/// ZigZag (sint32/sint64): 0, -1, 1, -2 … → 0, 1, 2, 3 …
+pub fn zigzag(n: int) -> int {
+    (n << 1) ^ (n >> 63)
+}
+
+pub fn unzigzag(n: int) -> int {
+    // Logical shift right by one, then flip with the low bit.
+    ((n >> 1) & math.MAX_INT) ^ (0 - (n & 1))
+}
+
+/// Truncates an int to its low 32 bits read as signed (int32/sint32/sfixed32 semantics).
+pub fn to_i32(n: int) -> int {
+    let low = n & 0xFFFF_FFFF;
+    if (low >= 0x8000_0000) { low - 0x1_0000_0000 } else { low }
+}
+
+/// Truncates an int to its low 32 bits read as unsigned (uint32/fixed32).
+pub fn to_u32(n: int) -> int {
+    n & 0xFFFF_FFFF
+}
+
+// ---- typed field writers (tag + value) ----
+
+pub fn write_int(w: Writer, field: int, v: int) {
+    put_tag(w, field, VARINT);
+    put_varint(w, v);
+}
+
+/// int32 is sign-extended to 64 bits on the wire (a negative int32 is 10 octets).
+pub fn write_int32(w: Writer, field: int, v: int) {
+    write_int(w, field, to_i32(v));
+}
+
+pub fn write_uint32(w: Writer, field: int, v: int) {
+    write_int(w, field, to_u32(v));
+}
+
+pub fn write_sint(w: Writer, field: int, v: int) {
+    write_int(w, field, zigzag(v));
+}
+
+pub fn write_bool(w: Writer, field: int, v: bool) {
+    write_int(w, field, if (v) { 1 } else { 0 });
+}
+
+pub fn write_fixed32(w: Writer, field: int, v: int) {
+    put_tag(w, field, I32);
+    put_fixed32(w, v);
+}
+
+pub fn write_fixed64(w: Writer, field: int, v: int) {
+    put_tag(w, field, I64);
+    put_fixed64(w, v);
+}
+
+pub fn write_double(w: Writer, field: int, v: float) {
+    write_fixed64(w, field, math.float_bits(v));
+}
+
+pub fn write_float(w: Writer, field: int, v: float) {
+    write_fixed32(w, field, f32_bits(v));
+}
+
+pub fn write_bytes(w: Writer, field: int, b: bytes) {
+    put_tag(w, field, LEN);
+    put_len_delim(w, b);
+}
+
+pub fn write_string(w: Writer, field: int, s: string) {
+    write_bytes(w, field, s.to_bytes());
+}
+
+/// A packed repeated field of varints (already converted: zigzag/int32 done by the caller).
+pub fn write_packed_varints(w: Writer, field: int, vs: [int]) {
+    let inner = writer();
+    for v in vs {
+        put_varint(inner, v);
+    }
+    write_bytes(w, field, finish(inner));
+}
+
+pub fn write_packed_fixed32(w: Writer, field: int, vs: [int]) {
+    let inner = writer();
+    for v in vs {
+        put_fixed32(inner, v);
+    }
+    write_bytes(w, field, finish(inner));
+}
+
+pub fn write_packed_fixed64(w: Writer, field: int, vs: [int]) {
+    let inner = writer();
+    for v in vs {
+        put_fixed64(inner, v);
+    }
+    write_bytes(w, field, finish(inner));
+}
+
+// ---- float32 by hand: std/math only has the f64 bits ----
+
+/// The IEEE 754 binary32 bits of `f` (rounded to nearest, ties to even), as an int in
+/// 0..2^32. std/math only converts binary64.
+pub fn f32_bits(f: float) -> int {
+    let b = math.float_bits(f);
+    let sign = (b >> 63) & 1;
+    let exp = (b >> 52) & 0x7FF;
+    let mant = b & 0x000F_FFFF_FFFF_FFFF;
+    let s32 = sign << 31;
+    if (exp == 0x7FF) {
+        // Infinity or NaN (keep a quiet NaN).
+        if (mant == 0) {
+            return s32 | 0x7F80_0000;
+        }
+        return s32 | 0x7FC0_0000 | ((mant >> 29) & 0x003F_FFFF);
+    }
+    if (exp == 0 && mant == 0) {
+        return s32;
+    }
+    // Unbiased exponent; the f64 value is 1.mant * 2^e (subnormal f64s are far below f32's range).
+    let e = exp - 1023;
+    if (e > 127) {
+        return s32 | 0x7F80_0000;
+    }
+    // Full 53-bit significand with the implicit one.
+    let sig = mant | 0x0010_0000_0000_0000;
+    var shift = 29;
+    var e32 = e + 127;
+    if (e32 <= 0) {
+        // Subnormal (or underflow to zero): shift further right.
+        shift = 29 + (1 - e32);
+        e32 = 0;
+        if (shift > 53) {
+            return s32;
+        }
+    }
+    var m = sig >> shift;
+    let rem = sig & ((1 << shift) - 1);
+    let half = 1 << (shift - 1);
+    if (rem > half || (rem == half && (m & 1) == 1)) {
+        m = m + 1;
+    }
+    if (e32 == 0) {
+        // m already carries no implicit bit; a carry into bit 23 makes it the smallest normal.
+        return s32 | m;
+    }
+    // m has the implicit bit at position 23; a rounding carry may push it to 24.
+    if (m >= 0x0100_0000) {
+        m = m >> 1;
+        e32 = e32 + 1;
+        if (e32 >= 255) {
+            return s32 | 0x7F80_0000;
+        }
+    }
+    s32 | (e32 << 23) | (m & 0x007F_FFFF)
+}
+
+/// The float (f64) whose value is the binary32 number with bits `bits`.
+pub fn f32_from_bits(bits: int) -> float {
+    let sign = (bits >> 31) & 1;
+    let exp = (bits >> 23) & 0xFF;
+    let mant = bits & 0x007F_FFFF;
+    let s64 = sign << 63;
+    if (exp == 0xFF) {
+        if (mant == 0) {
+            return math.float_from_bits(s64 | 0x7FF0_0000_0000_0000);
+        }
+        return math.float_from_bits(s64 | 0x7FF8_0000_0000_0000 | (mant << 29));
+    }
+    if (exp == 0) {
+        if (mant == 0) {
+            return math.float_from_bits(s64);
+        }
+        // Subnormal binary32: normalize into binary64.
+        var m = mant;
+        var e = -126;
+        while ((m & 0x0080_0000) == 0) {
+            m = m << 1;
+            e = e - 1;
+        }
+        let m52 = (m & 0x007F_FFFF) << 29;
+        return math.float_from_bits(s64 | ((e + 1023) << 52) | m52);
+    }
+    let e64 = exp - 127 + 1023;
+    math.float_from_bits(s64 | (e64 << 52) | (mant << 29))
+}
+
+// ---- reading ----
+
+/// A cursor over a message. Every read returns `Err` on malformed input; nothing panics.
+pub struct Reader {
+    data: bytes,
+    pos: int,
+    end: int,
+}
+
+pub fn reader(data: bytes) -> Reader {
+    Reader { data: data, pos: 0, end: data.len() }
+}
+
+pub fn at_end(r: Reader) -> bool {
+    r.pos >= r.end
+}
+
+pub fn read_varint(r: Reader) -> Result<int, string> {
+    var result = 0;
+    var shift = 0;
+    while (true) {
+        if (r.pos >= r.end) {
+            return Result.Err("truncated varint at offset ${r.pos}");
+        }
+        let b = r.data[r.pos];
+        r.pos = r.pos + 1;
+        if (shift == 63) {
+            // The 10th octet may only carry the top bit of a 64-bit value.
+            if (b > 1) {
+                return Result.Err("varint longer than 64 bits at offset ${r.pos - 1}");
+            }
+            return Result.Ok(result | (b << 63));
+        }
+        result = result | ((b & 0x7F) << shift);
+        if (b < 0x80) {
+            return Result.Ok(result);
+        }
+        shift = shift + 7;
+    }
+}
+
+pub fn read_fixed32(r: Reader) -> Result<int, string> {
+    if (r.end - r.pos < 4) {
+        return Result.Err("truncated fixed32 at offset ${r.pos}");
+    }
+    var v = 0;
+    for i in 0..4 {
+        v = v | (r.data[r.pos + i] << (8 * i));
+    }
+    r.pos = r.pos + 4;
+    Result.Ok(v)
+}
+
+pub fn read_fixed64(r: Reader) -> Result<int, string> {
+    if (r.end - r.pos < 8) {
+        return Result.Err("truncated fixed64 at offset ${r.pos}");
+    }
+    var v = 0;
+    for i in 0..8 {
+        v = v | (r.data[r.pos + i] << (8 * i));
+    }
+    r.pos = r.pos + 8;
+    Result.Ok(v)
+}
+
+pub fn read_len_delim(r: Reader) -> Result<bytes, string> {
+    let n = read_varint(r)?;
+    if (n < 0 || n > r.end - r.pos) {
+        return Result.Err("length ${n} runs past the end of the message (offset ${r.pos})");
+    }
+    let b = r.data.sub_bytes(r.pos, r.pos + n);
+    r.pos = r.pos + n;
+    Result.Ok(b)
+}
+
+/// A field key.
+pub struct Tag {
+    field: int,
+    wire: int,
+}
+
+pub fn read_tag(r: Reader) -> Result<Tag, string> {
+    let key = read_varint(r)?;
+    let field = (key >> 3) & 0x1FFF_FFFF_FFFF_FFFF;
+    let wire = key & 7;
+    if (field <= 0 || field > MAX_FIELD) {
+        return Result.Err("invalid field number ${field} at offset ${r.pos}");
+    }
+    if (wire == 6 || wire == 7) {
+        return Result.Err("invalid wire type ${wire} for field ${field}");
+    }
+    Result.Ok(Tag { field: field, wire: wire })
+}
+
+/// Skips the value of a field with wire type `wire` (groups included, nested).
+pub fn skip(r: Reader, t: Tag) -> Result<int, string> {
+    match (t.wire) {
+        0 => {
+            read_varint(r)?;
+        },
+        1 => {
+            read_fixed64(r)?;
+        },
+        2 => {
+            read_len_delim(r)?;
+        },
+        5 => {
+            read_fixed32(r)?;
+        },
+        3 => {
+            while (true) {
+                if (at_end(r)) {
+                    return Result.Err("unterminated group ${t.field}");
+                }
+                let inner = read_tag(r)?;
+                if (inner.wire == EGROUP) {
+                    if (inner.field != t.field) {
+                        return Result.Err("group ${t.field} closed by end-group ${inner.field}");
+                    }
+                    break;
+                }
+                skip(r, inner)?;
+            }
+        },
+        _ => return Result.Err("unexpected end-group ${t.field}"),
+    }
+    Result.Ok(0)
+}
+
+/// One raw field value, schema-less (what `protoc --decode_raw` sees).
+pub enum Raw {
+    Varint(int),
+    Fixed64(int),
+    Bytes(bytes),
+    Fixed32(int),
+    Group([RawField]),
+}
+
+pub struct RawField {
+    field: int,
+    value: Raw,
+}
+
+/// Parses a whole message into raw fields, in wire order, keeping repeats and unknowns.
+pub fn parse_raw(data: bytes) -> Result<[RawField], string> {
+    let r = reader(data);
+    parse_raw_until(r, 0)
+}
+
+fn parse_raw_until(r: Reader, group: int) -> Result<[RawField], string> {
+    var out: [RawField] = [];
+    while (!at_end(r)) {
+        let t = read_tag(r)?;
+        let v = match (t.wire) {
+            0 => Raw.Varint(read_varint(r)?),
+            1 => Raw.Fixed64(read_fixed64(r)?),
+            2 => Raw.Bytes(read_len_delim(r)?),
+            5 => Raw.Fixed32(read_fixed32(r)?),
+            3 => Raw.Group(parse_raw_until(r, t.field)?),
+            _ => {
+                if (group == t.field) {
+                    return Result.Ok(out);
+                }
+                return Result.Err("unexpected end-group ${t.field}");
+            },
+        };
+        out.push(RawField { field: t.field, value: v });
+    }
+    if (group != 0) {
+        return Result.Err("unterminated group ${group}");
+    }
+    Result.Ok(out)
+}
+
+/// Unpacks a packed run of varints.
+pub fn unpack_varints(b: bytes) -> Result<[int], string> {
+    let r = reader(b);
+    var out: [int] = [];
+    while (!at_end(r)) {
+        out.push(read_varint(r)?);
+    }
+    Result.Ok(out)
+}
+
+pub fn unpack_fixed32(b: bytes) -> Result<[int], string> {
+    if (b.len() % 4 != 0) {
+        return Result.Err("packed fixed32 run of ${b.len()} octets");
+    }
+    let r = reader(b);
+    var out: [int] = [];
+    while (!at_end(r)) {
+        out.push(read_fixed32(r)?);
+    }
+    Result.Ok(out)
+}
+
+pub fn unpack_fixed64(b: bytes) -> Result<[int], string> {
+    if (b.len() % 8 != 0) {
+        return Result.Err("packed fixed64 run of ${b.len()} octets");
+    }
+    let r = reader(b);
+    var out: [int] = [];
+    while (!at_end(r)) {
+        out.push(read_fixed64(r)?);
+    }
+    Result.Ok(out)
+}
+
+// ---- typed messages ----
+
+/// A message type with a hand-written codec. `encode_to` writes the fields in field-number
+/// order; `merge_field` consumes the value of one field it knows and returns `Ok(false)`
+/// for a field it does not, which `decode_into` then skips (unknown fields are tolerated,
+/// as proto3 requires).
+pub trait Message {
+    fn encode_to(self, w: Writer);
+    fn merge_field(self, r: Reader, t: Tag) -> Result<bool, string>;
+}
+
+pub fn encode<M: Message>(m: M) -> bytes {
+    let w = writer();
+    m.encode_to(w);
+    finish(w)
+}
+
+/// Decodes `data` into `m` (which starts as the empty message) and returns it.
+pub fn decode_into<M: Message>(m: M, data: bytes) -> Result<M, string> {
+    let r = reader(data);
+    while (!at_end(r)) {
+        let t = read_tag(r)?;
+        let known = m.merge_field(r, t)?;
+        if (!known) {
+            skip(r, t)?;
+        }
+    }
+    Result.Ok(m)
+}
+
+/// Writes a nested message field.
+pub fn write_message<M: Message>(w: Writer, field: int, m: M) {
+    write_bytes(w, field, encode(m));
+}
+
+/// The value of a LEN field as a string, checking the wire type and UTF-8.
+pub fn string_of(r: Reader, t: Tag) -> Result<string, string> {
+    if (t.wire != LEN) {
+        return Result.Err("field ${t.field}: expected a string, got wire type ${t.wire}");
+    }
+    let b = read_len_delim(r)?;
+    match (from_utf8(b)) {
+        Result.Ok(s) => Result.Ok(s),
+        Result.Err(_) => Result.Err("field ${t.field}: invalid UTF-8"),
+    }
+}
+
+pub fn bytes_of_field(r: Reader, t: Tag) -> Result<bytes, string> {
+    if (t.wire != LEN) {
+        return Result.Err("field ${t.field}: expected bytes, got wire type ${t.wire}");
+    }
+    read_len_delim(r)
+}
+
+pub fn varint_of(r: Reader, t: Tag) -> Result<int, string> {
+    if (t.wire != VARINT) {
+        return Result.Err("field ${t.field}: expected a varint, got wire type ${t.wire}");
+    }
+    read_varint(r)
+}
+
+pub fn bool_of(r: Reader, t: Tag) -> Result<bool, string> {
+    Result.Ok(varint_of(r, t)? != 0)
+}

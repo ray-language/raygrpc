@@ -1,0 +1,169 @@
+// JSON ↔ protobuf with the schema, checked against protoc's bytes (tests/fixtures/
+// everything.bin = protoc --encode of everything.txt, the same message as everything.json).
+
+import codec;
+import loader;
+import schema;
+import wire;
+import std/fs;
+import std/json;
+
+fn demo() -> schema.Registry {
+    loader.demo_registry().unwrap()
+}
+
+fn encode(reg: schema.Registry, t: string, text: string) -> Result<bytes, string> {
+    codec.from_json(reg, t, text)
+}
+
+fn decode_text(reg: schema.Registry, t: string, b: bytes) -> string {
+    json.render_doc(codec.to_json(reg, t, b, codec.options()).unwrap())
+}
+
+@test
+fn json_encodes_to_protocs_exact_bytes() {
+    let reg = demo();
+    let text = fs.read_file("tests/fixtures/everything.json").unwrap();
+    let ours = encode(reg, "raygrpc.demo.Everything", text).unwrap();
+    assert_eq(ours, fs.read_file_bytes("tests/fixtures/everything.bin").unwrap());
+}
+
+@test
+fn protoc_bytes_decode_and_round_trip() {
+    let reg = demo();
+    let bin = fs.read_file_bytes("tests/fixtures/everything.bin").unwrap();
+    let doc = codec.to_json(reg, "raygrpc.demo.Everything", bin, codec.options()).unwrap();
+    let m = schema.message(reg, "raygrpc.demo.Everything").unwrap();
+    assert_eq(codec.encode_message(reg, m, doc, 0).unwrap(), bin);
+    let text = json.render_doc(doc);
+    assert(text.contains("\"fUint64\":\"18446744073709551615\""));
+    assert(text.contains("\"fSint64\":\"-9223372036854775808\""));
+    assert(text.contains("\"fFloat\":0.1"));
+    assert(text.contains("\"fBytes\":\"AAH/YWJj\""));
+    assert(text.contains("\"level\":\"HIGH\""));
+    assert(text.contains("\"pointsById\":{\"7\":{\"x\":1}}"));
+    assert(text.contains("\"maybe\":0"));
+}
+
+@test
+fn decode_raw_matches_protoc_decode_raw() {
+    let bin = fs.read_file_bytes("tests/fixtures/everything.bin").unwrap();
+    assert_eq(codec.decode_raw_text(bin).unwrap(), fs.read_file("tests/fixtures/everything.raw").unwrap());
+    let pb = fs.read_file_bytes("tests/fixtures/all.pb").unwrap();
+    assert_eq(codec.decode_raw_text(pb).unwrap(), fs.read_file("tests/fixtures/all.raw").unwrap());
+}
+
+@test
+fn defaults_are_omitted_unless_asked() {
+    let reg = demo();
+    let empty = encode(reg, "raygrpc.demo.Everything", `{"fInt32": 0, "fString": "", "fBool": false, "level": "LEVEL_UNSPECIFIED"}`).unwrap();
+    assert_eq(empty.len(), 0);
+    assert_eq(decode_text(reg, "raygrpc.demo.Everything", empty), "{}");
+    let opts = codec.options();
+    opts.emit_defaults = true;
+    let full = json.render_doc(codec.to_json(reg, "raygrpc.demo.HelloRequest", bytes_of([]), opts).unwrap());
+    assert_eq(full, "{\"name\":\"\"}");
+    // proto3 optional and oneof members have presence: a zero is written.
+    assert_eq(encode(reg, "raygrpc.demo.Everything", `{"maybe": 0}`).unwrap(), bytes_of([0xE8, 0x01, 0x00]));
+    assert_eq(encode(reg, "raygrpc.demo.Everything", `{"text": ""}`).unwrap(), bytes_of([0xD2, 0x01, 0x00]));
+}
+
+@test
+fn proto_names_are_accepted_and_printed_on_request() {
+    let reg = demo();
+    let a = encode(reg, "raygrpc.demo.Everything", `{"f_int64": "5", "packed_ints": [1]}`).unwrap();
+    let b = encode(reg, "raygrpc.demo.Everything", `{"fInt64": 5, "packedInts": [1]}`).unwrap();
+    assert_eq(a, b);
+    let opts = codec.options();
+    opts.proto_names = true;
+    assert_eq(json.render_doc(codec.to_json(reg, "raygrpc.demo.Everything", a, opts).unwrap()), "{\"f_int64\":\"5\",\"packed_ints\":[1]}");
+}
+
+fn err_of(reg: schema.Registry, text: string) -> string {
+    match (encode(reg, "raygrpc.demo.Everything", text)) {
+        Result.Ok(_) => "",
+        Result.Err(e) => e,
+    }
+}
+
+@test
+fn bad_json_is_explained() {
+    let reg = demo();
+    assert(err_of(reg, `{"nope": 1}`).contains("has no known field named nope"));
+    assert(err_of(reg, `{"fInt32": 2147483648}`).contains("out of range"));
+    assert(err_of(reg, `{"fUint32": -1}`).contains("negative"));
+    assert(err_of(reg, `{"fUint64": "18446744073709551616"}`).contains("out of range"));
+    assert(err_of(reg, `{"fInt32": 1.5}`).contains("not an integer"));
+    assert(err_of(reg, `{"fBytes": "%%%"}`).contains("base64"));
+    assert(err_of(reg, `{"level": "MEDIUM"}`).contains("no value named MEDIUM"));
+    assert(err_of(reg, `{"text": "a", "at": {}}`).contains("oneof choice is already set"));
+    assert(err_of(reg, `{"names": "a"}`).contains("must be an array"));
+    assert(err_of(reg, `{"counters": {"k": "x"}}`).contains("invalid integer"));
+    assert(err_of(reg, `{"fFloat": 1e39}`).contains("out of range for float"));
+    assert(err_of(reg, `[1]`).contains("expected an object"));
+    assert(err_of(reg, `{"fInt32": `).contains("invalid JSON"));
+}
+
+@test
+fn json_number_forms_follow_protojson() {
+    let reg = demo();
+    // Integers: numbers, strings, exponents when integral; enums by name or number.
+    assert_eq(encode(reg, "raygrpc.demo.Everything", `{"fInt32": "12"}`).unwrap(), encode(reg, "raygrpc.demo.Everything", `{"fInt32": 1.2e1}`).unwrap());
+    assert_eq(encode(reg, "raygrpc.demo.Everything", `{"level": 2}`).unwrap(), encode(reg, "raygrpc.demo.Everything", `{"level": "HIGH"}`).unwrap());
+    // Floats: NaN and the infinities travel as strings.
+    let specials = encode(reg, "raygrpc.demo.Everything", `{"fDouble": "NaN", "fFloat": "-Infinity"}`).unwrap();
+    assert_eq(decode_text(reg, "raygrpc.demo.Everything", specials), "{\"fDouble\":\"NaN\",\"fFloat\":\"-Infinity\"}");
+    // URL-safe base64 without padding is accepted; output is standard with padding.
+    let b = encode(reg, "raygrpc.demo.Everything", `{"fBytes": "-_8"}`).unwrap();
+    assert_eq(decode_text(reg, "raygrpc.demo.Everything", b), "{\"fBytes\":\"+/8=\"}");
+}
+
+@test
+fn floats_print_like_protojson() {
+    assert_eq(json.render_doc(codec.render_float(0.1, false)), "0.1");
+    assert_eq(json.render_doc(codec.render_float(1e21, false)), "1e+21");
+    assert_eq(json.render_doc(codec.render_float(1e20, false)), "100000000000000000000");
+    assert_eq(json.render_doc(codec.render_float(1.5e-7, false)), "1.5e-07");
+    assert_eq(json.render_doc(codec.render_float(0.000001, false)), "0.000001");
+    assert_eq(json.render_doc(codec.render_float(-2.5, false)), "-2.5");
+    assert_eq(json.render_doc(codec.render_float(123456.0, false)), "123456");
+    // binary32: the shortest digits that read back as the same binary32.
+    assert_eq(json.render_doc(codec.render_float(wire.f32_from_bits(wire.f32_bits(0.1)), true)), "0.1");
+    assert_eq(json.render_doc(codec.render_float(wire.f32_from_bits(wire.f32_bits(3.14159)), true)), "3.14159");
+    assert_eq(json.render_doc(codec.render_float(wire.f32_from_bits(0x7F7F_FFFF), true)), "3.4028235e+38");
+}
+
+@test
+fn wire_quirks_decode_like_protobuf() {
+    let reg = demo();
+    // Unknown fields are skipped; a repeated scalar arrives unpacked; the last singular wins;
+    // two occurrences of a singular message merge.
+    let w = wire.writer();
+    wire.write_int(w, 999, 7);
+    wire.write_int(w, 18, 5);
+    wire.write_int(w, 18, 6);
+    wire.write_int(w, 3, 1);
+    wire.write_int(w, 3, 2);
+    let p1 = wire.writer();
+    wire.write_sint(p1, 1, 4);
+    wire.write_bytes(w, 17, wire.finish(p1));
+    let p2 = wire.writer();
+    wire.write_sint(p2, 2, -4);
+    wire.write_bytes(w, 17, wire.finish(p2));
+    let text = decode_text(reg, "raygrpc.demo.Everything", wire.finish(w));
+    assert_eq(text, "{\"fInt32\":2,\"point\":{\"x\":4,\"y\":-4},\"packedInts\":[5,6]}");
+    // A value with the wrong wire type for its field is skipped like an unknown field.
+    let odd = wire.writer();
+    wire.write_string(odd, 3, "x");
+    wire.write_int(odd, 14, 1);
+    assert_eq(decode_text(reg, "raygrpc.demo.Everything", wire.finish(odd)), "{}");
+    // Malformed bytes are an Err.
+    assert(codec.to_json(reg, "raygrpc.demo.Everything", bytes_of([0x0A, 0x05]), codec.options()).is_err());
+}
+
+@test
+fn unsigned_text_covers_the_upper_half() {
+    assert_eq(codec.unsigned_text(-1), "18446744073709551615");
+    assert_eq(codec.unsigned_text(5), "5");
+    assert_eq(codec.unsigned_text(-9223372036854775807 - 1), "9223372036854775808");
+}

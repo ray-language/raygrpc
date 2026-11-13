@@ -1,0 +1,11 @@
+[package]
+name = "raygrpc"
+version = "0.1.0"
+license = "Apache-2.0"
+raylang = "1.27.95"
+
+[dependencies]
+net = "^0.15.0"
+
+[native]
+embed = ["proto"]

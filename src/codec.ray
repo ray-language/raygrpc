@@ -1,0 +1,773 @@
+//! Dynamic messages: protobuf bytes ↔ JSON, driven by a schema, following the proto3 JSON
+//! mapping (what grpcurl prints and accepts): lowerCamel field names (proto names accepted
+//! on input), 64-bit integers as strings, bytes as base64, enums by name, maps as objects,
+//! default values omitted, NaN/Infinity as strings.
+//!
+//! Encoding writes fields in field-number order and packs repeated scalars, so its bytes
+//! match `protoc --encode`. Decoding is total: malformed bytes are an `Err`, never a panic.
+
+import schema;
+import wire;
+import std/base64;
+import std/json;
+import std/math;
+
+pub struct Options {
+    /// Print fields with default values too (grpcurl's -emit-defaults).
+    emit_defaults: bool,
+    /// Use the proto field names instead of the lowerCamel JSON names.
+    proto_names: bool,
+}
+
+pub fn options() -> Options {
+    Options { emit_defaults: false, proto_names: false }
+}
+
+const MAX_DEPTH: int = 100;
+
+// ---- numbers ----
+
+/// The shortest decimal digits that read back as the same float (binary64, or binary32 when
+/// `is32`), rendered the way protojson does: positional for 1e-6 <= |x| < 1e21, else exponent.
+pub fn render_float(x: float, is32: bool) -> json.Doc {
+    if (x != x) {
+        return json.Doc.Str("NaN");
+    }
+    if (x > 1.7976931348623157e308) {
+        return json.Doc.Str("Infinity");
+    }
+    if (x < -1.7976931348623157e308) {
+        return json.Doc.Str("-Infinity");
+    }
+    if (x == 0.0) {
+        return json.Doc.Num(if (math.float_bits(x) < 0) { "-0" } else { "0" });
+    }
+    var e = "";
+    for p in 0..17 {
+        let s = math.format_float(x, "e", p);
+        let back = parse_float(s).unwrap_or(0.0);
+        let same = if (is32) { wire.f32_bits(back) == wire.f32_bits(x) } else { back == x };
+        if (same) {
+            e = s;
+            break;
+        }
+    }
+    if (e == "") {
+        e = math.format_float(x, "e", 17);
+    }
+    // e = [-]d[.ddd]e±XX
+    let neg = e.starts_with("-");
+    let body = if (neg) { e.substring(1, e.len()) } else { e };
+    let epos = body.index_of("e").unwrap_or(body.len());
+    let mant = body.substring(0, epos).replace(".", "");
+    let exp = parse_int(body.substring(epos + 1, body.len())).unwrap_or(0);
+    let sign = if (neg) { "-" } else { "" };
+    if (exp < -6 || exp >= 21) {
+        // Go's 'e' format: at least two exponent digits.
+        let frac = if (mant.len() > 1) { "." + mant.substring(1, mant.len()) } else { "" };
+        let ae = if (exp < 0) { 0 - exp } else { exp };
+        let es = if (ae < 10) { "0${ae}" } else { "${ae}" };
+        let esign = if (exp < 0) { "-" } else { "+" };
+        return json.Doc.Num("${sign}${mant.substring(0, 1)}${frac}e${esign}${es}");
+    }
+    if (exp < 0) {
+        return json.Doc.Num("${sign}0.${"0".repeat(0 - exp - 1)}${mant}");
+    }
+    if (mant.len() <= exp + 1) {
+        return json.Doc.Num("${sign}${mant}${"0".repeat(exp + 1 - mant.len())}");
+    }
+    json.Doc.Num("${sign}${mant.substring(0, exp + 1)}.${mant.substring(exp + 1, mant.len())}")
+}
+
+/// The unsigned decimal of a 64-bit pattern (uint64/fixed64 above 2^63 - 1 are negative ints).
+pub fn unsigned_text(n: int) -> string {
+    if (n >= 0) {
+        return "${n}";
+    }
+    to_string(n as u64)
+}
+
+const U64_MAX_TEXT: string = "18446744073709551615";
+
+/// Parses a decimal into a 64-bit pattern: signed when `unsigned` is false, else 0..2^64-1.
+fn parse_integer(text: string, unsigned: bool) -> Result<int, string> {
+    var t = text.trim();
+    if (t.contains("e") || t.contains("E") || t.contains(".")) {
+        // protojson accepts an exponent or fraction when the value is integral.
+        let f = match (parse_float(t)) {
+            Option.Some(v) => v,
+            Option.None => return Result.Err("invalid integer ${text}"),
+        };
+        if (math.trunc(f) != f || f > 9.2e18 || f < -9.2e18) {
+            return Result.Err("not an integer: ${text}");
+        }
+        t = "${f as int}";
+    }
+    if (!unsigned) {
+        return match (parse_int(t)) {
+            Option.Some(v) => Result.Ok(v),
+            Option.None => Result.Err("invalid integer ${text}"),
+        };
+    }
+    if (t.starts_with("-")) {
+        return Result.Err("negative value ${text} for an unsigned field");
+    }
+    let digits = t.strip_prefix("+").unwrap_or(t);
+    if (digits.len() == 0) {
+        return Result.Err("invalid integer ${text}");
+    }
+    for c in digits.chars() {
+        if (c < '0' || c > '9') {
+            return Result.Err("invalid integer ${text}");
+        }
+    }
+    var d = digits;
+    while (d.len() > 1 && d.starts_with("0")) {
+        d = d.substring(1, d.len());
+    }
+    if (d.len() > 20 || (d.len() == 20 && d > U64_MAX_TEXT)) {
+        return Result.Err("value ${text} out of range for a 64-bit unsigned field");
+    }
+    var acc: u64 = 0;
+    let ten: u64 = 10;
+    for c in d.chars() {
+        acc = acc * ten + ((char_code(c) - 48) as u64);
+    }
+    Result.Ok(acc as int)
+}
+
+fn int_in_range(v: int, kind: int, text: string) -> Result<int, string> {
+    let ok = match (kind) {
+        5 => v >= -2147483648 && v <= 2147483647,
+        17 => v >= -2147483648 && v <= 2147483647,
+        15 => v >= -2147483648 && v <= 2147483647,
+        13 => v >= 0 && v <= 4294967295,
+        7 => v >= 0 && v <= 4294967295,
+        _ => true,
+    };
+    if (!ok) {
+        return Result.Err("value ${text} out of range for ${schema.type_label(kind)}");
+    }
+    Result.Ok(v)
+}
+
+fn is_unsigned64(kind: int) -> bool {
+    kind == schema.T_UINT64 || kind == schema.T_FIXED64
+}
+
+fn is_64bit(kind: int) -> bool {
+    kind == schema.T_INT64 || kind == schema.T_UINT64 || kind == schema.T_FIXED64 || kind == schema.T_SFIXED64 || kind == schema.T_SINT64
+}
+
+fn is_integer(kind: int) -> bool {
+    [3, 4, 5, 6, 7, 13, 15, 16, 17, 18].contains(kind)
+}
+
+// ---- decoding: bytes → JSON ----
+
+/// One scalar from its raw wire value, as a JSON value.
+fn scalar_json(reg: schema.Registry, f: schema.FieldDef, v: wire.Raw, opts: Options, depth: int) -> Result<json.Doc, string> {
+    let k = f.kind;
+    match (v) {
+        wire.Raw.Varint(n) => {
+            if (k == schema.T_BOOL) {
+                return Result.Ok(json.Doc.Bool(n != 0));
+            }
+            if (k == schema.T_ENUM) {
+                let e = schema.enum_def(reg, f.type_name)?;
+                let num = wire.to_i32(n);
+                return Result.Ok(match (schema.enum_name(e, num)) {
+                    Option.Some(name) => json.Doc.Str(name),
+                    Option.None => json.Doc.Num("${num}"),
+                });
+            }
+            let value = match (k) {
+                5 => "${wire.to_i32(n)}",
+                13 => "${wire.to_u32(n)}",
+                17 => "${wire.unzigzag(wire.to_u32(n))}",
+                18 => "${wire.unzigzag(n)}",
+                3 => "${n}",
+                4 => unsigned_text(n),
+                _ => return Result.Err("field ${f.name}: a varint for a ${schema.type_label(k)} field"),
+            };
+            if (k == schema.T_SINT32) {
+                // A sint32 decoded from a 64-bit varint keeps only the low 32 bits.
+                let z = wire.unzigzag(wire.to_u32(n));
+                return Result.Ok(json.Doc.Num("${wire.to_i32(z)}"));
+            }
+            Result.Ok(if (is_64bit(k)) { json.Doc.Str(value) } else { json.Doc.Num(value) })
+        },
+        wire.Raw.Fixed64(n) => match (k) {
+            1 => Result.Ok(render_float(math.float_from_bits(n), false)),
+            6 => Result.Ok(json.Doc.Str(unsigned_text(n))),
+            16 => Result.Ok(json.Doc.Str("${n}")),
+            _ => Result.Err("field ${f.name}: a fixed64 for a ${schema.type_label(k)} field"),
+        },
+        wire.Raw.Fixed32(n) => match (k) {
+            2 => Result.Ok(render_float(wire.f32_from_bits(n), true)),
+            7 => Result.Ok(json.Doc.Num("${n}")),
+            15 => Result.Ok(json.Doc.Num("${wire.to_i32(n)}")),
+            _ => Result.Err("field ${f.name}: a fixed32 for a ${schema.type_label(k)} field"),
+        },
+        wire.Raw.Bytes(b) => match (k) {
+            9 => match (from_utf8(b)) {
+                Result.Ok(s) => Result.Ok(json.Doc.Str(s)),
+                Result.Err(_) => Result.Err("field ${f.name}: invalid UTF-8 in a string"),
+            },
+            12 => Result.Ok(json.Doc.Str(base64.base64(b))),
+            11 => {
+                let m = schema.message(reg, f.type_name)?;
+                decode_message(reg, m, b, opts, depth + 1)
+            },
+            _ => Result.Err("field ${f.name}: length-delimited data for a ${schema.type_label(k)} field"),
+        },
+        wire.Raw.Group(_) => Result.Err("field ${f.name}: groups are not supported"),
+    }
+}
+
+/// Expands packed runs into single values (a repeated scalar may arrive packed or not).
+fn expand(f: schema.FieldDef, vs: [wire.Raw]) -> Result<[wire.Raw], string> {
+    if (!schema.is_packable(f.kind)) {
+        return Result.Ok(vs);
+    }
+    var out: [wire.Raw] = [];
+    for v in vs {
+        match (v) {
+            wire.Raw.Bytes(b) => {
+                let k = f.kind;
+                if (k == schema.T_DOUBLE || k == schema.T_FIXED64 || k == schema.T_SFIXED64) {
+                    for x in wire.unpack_fixed64(b)? {
+                        out.push(wire.Raw.Fixed64(x));
+                    }
+                } else if (k == schema.T_FLOAT || k == schema.T_FIXED32 || k == schema.T_SFIXED32) {
+                    for x in wire.unpack_fixed32(b)? {
+                        out.push(wire.Raw.Fixed32(x));
+                    }
+                } else {
+                    for x in wire.unpack_varints(b)? {
+                        out.push(wire.Raw.Varint(x));
+                    }
+                }
+            },
+            other => out.push(other),
+        }
+    }
+    Result.Ok(out)
+}
+
+fn default_json(reg: schema.Registry, f: schema.FieldDef) -> json.Doc {
+    if (schema.is_repeated(f)) {
+        if (is_map_field(reg, f)) {
+            return json.Doc.Obj([]);
+        }
+        return json.Doc.List([]);
+    }
+    match (f.kind) {
+        8 => json.Doc.Bool(false),
+        9 => json.Doc.Str(""),
+        12 => json.Doc.Str(""),
+        11 => json.Doc.Null,
+        14 => {
+            match (schema.enum_def(reg, f.type_name)) {
+                Result.Ok(e) => match (schema.enum_name(e, 0)) {
+                    Option.Some(n) => json.Doc.Str(n),
+                    Option.None => json.Doc.Num("0"),
+                },
+                Result.Err(_) => json.Doc.Num("0"),
+            }
+        },
+        k => if (is_64bit(k)) { json.Doc.Str("0") } else { json.Doc.Num("0") },
+    }
+}
+
+fn is_map_field(reg: schema.Registry, f: schema.FieldDef) -> bool {
+    if (f.kind != schema.T_MESSAGE || !schema.is_repeated(f)) {
+        return false;
+    }
+    match (schema.message(reg, f.type_name)) {
+        Result.Ok(m) => m.map_entry,
+        Result.Err(_) => false,
+    }
+}
+
+fn map_key_text(d: json.Doc) -> string {
+    match (d) {
+        json.Doc.Str(s) => s,
+        json.Doc.Num(s) => s,
+        json.Doc.Bool(b) => if (b) { "true" } else { "false" },
+        _ => "",
+    }
+}
+
+/// Decodes `data` as message `m` into a JSON object.
+pub fn decode_message(reg: schema.Registry, m: schema.MessageDef, data: bytes, opts: Options, depth: int) -> Result<json.Doc, string> {
+    if (depth > MAX_DEPTH) {
+        return Result.Err("message nesting deeper than ${MAX_DEPTH}");
+    }
+    let raw = wire.parse_raw(data)?;
+    let by_number: Map<int, [wire.Raw]> = Map.new();
+    for rf in raw {
+        match (by_number.get(rf.field)) {
+            Option.Some(list) => list.push(rf.value),
+            Option.None => by_number.insert(rf.field, [rf.value]),
+        }
+    }
+    var members: [json.Member] = [];
+    for f in m.fields {
+        let key = if (opts.proto_names) { f.name } else { f.json_name };
+        let present = by_number.get(f.number);
+        let vs = match (present) {
+            Option.Some(list) => list,
+            Option.None => {
+                let has_presence = f.oneof_index >= 0 || f.kind == schema.T_MESSAGE && !schema.is_repeated(f);
+                if (opts.emit_defaults && !has_presence) {
+                    members.push(json.Member { key: key, value: default_json(reg, f) });
+                }
+                continue;
+            },
+        };
+        if (is_map_field(reg, f)) {
+            let entry = schema.message(reg, f.type_name)?;
+            let kf = schema.field_by_number(entry, 1).unwrap();
+            let vf = schema.field_by_number(entry, 2).unwrap();
+            var pairs: [json.Member] = [];
+            for v in vs {
+                let b = match (v) {
+                    wire.Raw.Bytes(x) => x,
+                    _ => return Result.Err("field ${f.name}: a map entry must be length-delimited"),
+                };
+                var kd = default_json(reg, kf);
+                var vd = default_json(reg, vf);
+                for ef in wire.parse_raw(b)? {
+                    if (ef.field == 1) {
+                        kd = scalar_json(reg, kf, ef.value, opts, depth)?;
+                    } else if (ef.field == 2) {
+                        vd = scalar_json(reg, vf, ef.value, opts, depth)?;
+                    }
+                }
+                if (vf.kind == schema.T_MESSAGE) {
+                    match (vd) {
+                        json.Doc.Null => vd = json.Doc.Obj([]),
+                        _ => {},
+                    }
+                }
+                // A repeated key: the last entry wins, in the position of the first.
+                let kt = map_key_text(kd);
+                var replaced = false;
+                for p in pairs {
+                    if (p.key == kt) {
+                        p.value = vd;
+                        replaced = true;
+                    }
+                }
+                if (!replaced) {
+                    pairs.push(json.Member { key: kt, value: vd });
+                }
+            }
+            members.push(json.Member { key: key, value: json.Doc.Obj(pairs) });
+        } else if (schema.is_repeated(f)) {
+            var items: [json.Doc] = [];
+            for v in expand(f, vs)? {
+                items.push(scalar_json(reg, f, v, opts, depth)?);
+            }
+            members.push(json.Member { key: key, value: json.Doc.List(items) });
+        } else if (f.kind == schema.T_MESSAGE) {
+            // Repeated occurrences of a singular message merge: decode their concatenation.
+            var parts: [bytes] = [];
+            for v in vs {
+                match (v) {
+                    wire.Raw.Bytes(b) => parts.push(b),
+                    _ => return Result.Err("field ${f.name}: a message must be length-delimited"),
+                }
+            }
+            let sub = schema.message(reg, f.type_name)?;
+            members.push(json.Member { key: key, value: decode_message(reg, sub, bytes_concat(parts), opts, depth + 1)? });
+        } else {
+            // Last one wins. A value with the wrong wire type is an unknown field (skipped),
+            // as the protobuf runtimes do.
+            var all: [wire.Raw] = [];
+            for v in vs {
+                if (wire_matches(f.kind, v)) {
+                    all.push(v);
+                }
+            }
+            if (all.len() == 0) {
+                continue;
+            }
+            let last = all[all.len() - 1];
+            let d = scalar_json(reg, f, last, opts, depth)?;
+            let implicit = f.oneof_index < 0;
+            if (implicit && !opts.emit_defaults && raw_is_zero(last)) {
+                continue;
+            }
+            members.push(json.Member { key: key, value: d });
+        }
+    }
+    Result.Ok(json.Doc.Obj(members))
+}
+
+fn wire_matches(kind: int, v: wire.Raw) -> bool {
+    match (v) {
+        wire.Raw.Varint(_) => [3, 4, 5, 8, 13, 14, 17, 18].contains(kind),
+        wire.Raw.Fixed64(_) => kind == 1 || kind == 6 || kind == 16,
+        wire.Raw.Fixed32(_) => kind == 2 || kind == 7 || kind == 15,
+        wire.Raw.Bytes(_) => kind == 9 || kind == 12 || kind == 11,
+        wire.Raw.Group(_) => false,
+    }
+}
+
+/// A wire value that encodes the proto3 default (implicit presence: not printed).
+fn raw_is_zero(v: wire.Raw) -> bool {
+    match (v) {
+        wire.Raw.Varint(n) => n == 0,
+        wire.Raw.Fixed64(n) => n == 0,
+        wire.Raw.Fixed32(n) => n == 0,
+        wire.Raw.Bytes(b) => b.len() == 0,
+        wire.Raw.Group(_) => false,
+    }
+}
+
+/// Decodes a message by name.
+pub fn to_json(reg: schema.Registry, type_name: string, data: bytes, opts: Options) -> Result<json.Doc, string> {
+    let m = schema.message(reg, type_name)?;
+    decode_message(reg, m, data, opts, 0)
+}
+
+// ---- encoding: JSON → bytes ----
+
+fn doc_kind(d: json.Doc) -> string {
+    match (d) {
+        json.Doc.Null => "null",
+        json.Doc.Bool(_) => "a boolean",
+        json.Doc.Num(_) => "a number",
+        json.Doc.Str(_) => "a string",
+        json.Doc.List(_) => "an array",
+        json.Doc.Obj(_) => "an object",
+    }
+}
+
+fn int_from_doc(f: schema.FieldDef, d: json.Doc) -> Result<int, string> {
+    let text = match (d) {
+        json.Doc.Num(s) => s,
+        json.Doc.Str(s) => s,
+        other => return Result.Err("field ${f.name}: expected an integer, got ${doc_kind(other)}"),
+    };
+    let v = match (parse_integer(text, is_unsigned64(f.kind) || f.kind == schema.T_UINT32 || f.kind == schema.T_FIXED32)) {
+        Result.Ok(x) => x,
+        Result.Err(e) => return Result.Err("field ${f.name}: ${e}"),
+    };
+    match (int_in_range(v, f.kind, text)) {
+        Result.Ok(x) => Result.Ok(x),
+        Result.Err(e) => Result.Err("field ${f.name}: ${e}"),
+    }
+}
+
+fn float_from_doc(f: schema.FieldDef, d: json.Doc) -> Result<float, string> {
+    let text = match (d) {
+        json.Doc.Num(s) => s,
+        json.Doc.Str(s) => s,
+        other => return Result.Err("field ${f.name}: expected a number, got ${doc_kind(other)}"),
+    };
+    let v = match (text) {
+        "NaN" => math.float_from_bits(0x7FF8_0000_0000_0000),
+        "Infinity" => math.float_from_bits(0x7FF0_0000_0000_0000),
+        "-Infinity" => math.float_from_bits(0x7FF0_0000_0000_0000 | math.MIN_INT),
+        t => match (parse_float(t)) {
+            Option.Some(x) => x,
+            Option.None => return Result.Err("field ${f.name}: invalid number ${t}"),
+        },
+    };
+    if (f.kind == schema.T_FLOAT && v == v && v > -1.7976931348623157e308 && v < 1.7976931348623157e308) {
+        if (v > 3.4028234663852886e38 || v < -3.4028234663852886e38) {
+            return Result.Err("field ${f.name}: ${text} out of range for float");
+        }
+    }
+    Result.Ok(v)
+}
+
+fn bytes_from_text(f: schema.FieldDef, s: string) -> Result<bytes, string> {
+    // protojson accepts standard and URL-safe base64, with or without padding.
+    var t = s.replace("-", "+").replace("_", "/");
+    while (t.len() % 4 != 0) {
+        t = t + "=";
+    }
+    match (base64.base64_decode(t)) {
+        Result.Ok(b) => Result.Ok(b),
+        Result.Err(e) => Result.Err("field ${f.name}: invalid base64: ${e}"),
+    }
+}
+
+fn enum_from_doc(reg: schema.Registry, f: schema.FieldDef, d: json.Doc) -> Result<int, string> {
+    let e = schema.enum_def(reg, f.type_name)?;
+    match (d) {
+        json.Doc.Str(s) => match (schema.enum_number(e, s)) {
+            Option.Some(n) => Result.Ok(n),
+            Option.None => Result.Err("field ${f.name}: enum ${e.full_name} has no value named ${s}"),
+        },
+        json.Doc.Num(s) => match (parse_int(s)) {
+            Option.Some(n) => int_in_range(n, schema.T_INT32, s),
+            Option.None => Result.Err("field ${f.name}: invalid enum number ${s}"),
+        },
+        other => Result.Err("field ${f.name}: expected an enum name or number, got ${doc_kind(other)}"),
+    }
+}
+
+/// The wire form of one scalar (no tag): a varint, a fixed value or a length-delimited body.
+enum Scalar {
+    V(int),
+    F32(int),
+    F64(int),
+    L(bytes),
+}
+
+fn scalar_of(reg: schema.Registry, f: schema.FieldDef, d: json.Doc, depth: int) -> Result<Scalar, string> {
+    let k = f.kind;
+    match (k) {
+        1 => Result.Ok(Scalar.F64(math.float_bits(float_from_doc(f, d)?))),
+        2 => Result.Ok(Scalar.F32(wire.f32_bits(float_from_doc(f, d)?))),
+        8 => match (d) {
+            json.Doc.Bool(b) => Result.Ok(Scalar.V(if (b) { 1 } else { 0 })),
+            other => Result.Err("field ${f.name}: expected a boolean, got ${doc_kind(other)}"),
+        },
+        9 => match (d) {
+            json.Doc.Str(s) => Result.Ok(Scalar.L(s.to_bytes())),
+            other => Result.Err("field ${f.name}: expected a string, got ${doc_kind(other)}"),
+        },
+        12 => match (d) {
+            json.Doc.Str(s) => Result.Ok(Scalar.L(bytes_from_text(f, s)?)),
+            other => Result.Err("field ${f.name}: expected base64 text, got ${doc_kind(other)}"),
+        },
+        14 => Result.Ok(Scalar.V(enum_from_doc(reg, f, d)?)),
+        11 => {
+            let m = schema.message(reg, f.type_name)?;
+            Result.Ok(Scalar.L(encode_message(reg, m, d, depth + 1)?))
+        },
+        6 => Result.Ok(Scalar.F64(int_from_doc(f, d)?)),
+        16 => Result.Ok(Scalar.F64(int_from_doc(f, d)?)),
+        7 => Result.Ok(Scalar.F32(int_from_doc(f, d)?)),
+        15 => Result.Ok(Scalar.F32(int_from_doc(f, d)?)),
+        17 => Result.Ok(Scalar.V(wire.to_u32(wire.zigzag(int_from_doc(f, d)?)))),
+        18 => Result.Ok(Scalar.V(wire.zigzag(int_from_doc(f, d)?))),
+        _ => Result.Ok(Scalar.V(int_from_doc(f, d)?)),
+    }
+}
+
+fn is_zero(s: Scalar) -> bool {
+    match (s) {
+        Scalar.V(n) => n == 0,
+        Scalar.F32(n) => n == 0,
+        Scalar.F64(n) => n == 0,
+        Scalar.L(b) => b.len() == 0,
+    }
+}
+
+fn put_scalar(w: wire.Writer, number: int, s: Scalar) {
+    match (s) {
+        Scalar.V(n) => wire.write_int(w, number, n),
+        Scalar.F32(n) => wire.write_fixed32(w, number, n),
+        Scalar.F64(n) => wire.write_fixed64(w, number, n),
+        Scalar.L(b) => wire.write_bytes(w, number, b),
+    }
+}
+
+fn put_packed(w: wire.Writer, number: int, ss: [Scalar]) {
+    if (ss.len() == 0) {
+        return;
+    }
+    let inner = wire.writer();
+    for s in ss {
+        match (s) {
+            Scalar.V(n) => wire.put_varint(inner, n),
+            Scalar.F32(n) => wire.put_fixed32(inner, n),
+            Scalar.F64(n) => wire.put_fixed64(inner, n),
+            Scalar.L(b) => wire.put_len_delim(inner, b),
+        }
+    }
+    wire.write_bytes(w, number, wire.finish(inner));
+}
+
+fn map_key_doc(kf: schema.FieldDef, key: string) -> json.Doc {
+    match (kf.kind) {
+        9 => json.Doc.Str(key),
+        8 => json.Doc.Bool(key == "true"),
+        _ => json.Doc.Str(key),
+    }
+}
+
+fn encode_field(reg: schema.Registry, w: wire.Writer, f: schema.FieldDef, d: json.Doc, depth: int) -> Result<int, string> {
+    if (is_map_field(reg, f)) {
+        let entry = schema.message(reg, f.type_name)?;
+        let kf = schema.field_by_number(entry, 1).unwrap();
+        let vf = schema.field_by_number(entry, 2).unwrap();
+        let members = match (d) {
+            json.Doc.Obj(ms) => ms,
+            other => return Result.Err("field ${f.name}: a map must be an object, got ${doc_kind(other)}"),
+        };
+        for m in members {
+            if (kf.kind == schema.T_BOOL && m.key != "true" && m.key != "false") {
+                return Result.Err("field ${f.name}: invalid bool map key ${m.key}");
+            }
+            let ew = wire.writer();
+            let ks = scalar_of(reg, kf, map_key_doc(kf, m.key), depth)?;
+            put_scalar(ew, 1, ks);
+            match (m.value) {
+                json.Doc.Null => return Result.Err("field ${f.name}: a map value cannot be null"),
+                _ => {},
+            }
+            let vs = scalar_of(reg, vf, m.value, depth)?;
+            put_scalar(ew, 2, vs);
+            wire.write_bytes(w, f.number, wire.finish(ew));
+        }
+        return Result.Ok(0);
+    }
+    if (schema.is_repeated(f)) {
+        let items = match (d) {
+            json.Doc.List(xs) => xs,
+            other => return Result.Err("field ${f.name}: a repeated field must be an array, got ${doc_kind(other)}"),
+        };
+        var ss: [Scalar] = [];
+        for x in items {
+            match (x) {
+                json.Doc.Null => return Result.Err("field ${f.name}: null inside a repeated field"),
+                _ => {},
+            }
+            ss.push(scalar_of(reg, f, x, depth)?);
+        }
+        if (schema.is_packable(f.kind) && !f.packed_off) {
+            put_packed(w, f.number, ss);
+        } else {
+            for s in ss {
+                put_scalar(w, f.number, s);
+            }
+        }
+        return Result.Ok(0);
+    }
+    let s = scalar_of(reg, f, d, depth)?;
+    // proto3 implicit presence: a zero scalar outside a oneof is not written.
+    let implicit = f.oneof_index < 0 && f.kind != schema.T_MESSAGE;
+    if (implicit && is_zero(s)) {
+        return Result.Ok(0);
+    }
+    put_scalar(w, f.number, s);
+    Result.Ok(0)
+}
+
+/// Encodes a JSON object as message `m`.
+pub fn encode_message(reg: schema.Registry, m: schema.MessageDef, d: json.Doc, depth: int) -> Result<bytes, string> {
+    if (depth > MAX_DEPTH) {
+        return Result.Err("message nesting deeper than ${MAX_DEPTH}");
+    }
+    let members = match (d) {
+        json.Doc.Obj(ms) => ms,
+        json.Doc.Null => [],
+        other => return Result.Err("message ${m.full_name}: expected an object, got ${doc_kind(other)}"),
+    };
+    let values: Map<int, json.Doc> = Map.new();
+    let oneof_set: Map<int, string> = Map.new();
+    for mem in members {
+        let f = match (schema.field_by_json(m, mem.key)) {
+            Option.Some(x) => x,
+            Option.None => return Result.Err("message type ${m.full_name} has no known field named ${mem.key}"),
+        };
+        if (values.contains_key(f.number)) {
+            return Result.Err("field ${f.name} given twice");
+        }
+        match (mem.value) {
+            // null = the default (and clears a oneof member: it does not count as set).
+            json.Doc.Null => continue,
+            _ => {},
+        }
+        if (f.oneof_index >= 0 && !f.proto3_optional) {
+            match (oneof_set.get(f.oneof_index)) {
+                Option.Some(other) => {
+                    return Result.Err("oneof ${m.oneofs[f.oneof_index]} is already set by ${other}; cannot set ${f.name}");
+                },
+                Option.None => oneof_set.insert(f.oneof_index, f.name),
+            }
+        }
+        values.insert(f.number, mem.value);
+    }
+    let w = wire.writer();
+    for f in schema.fields_by_number(m) {
+        match (values.get(f.number)) {
+            Option.Some(v) => {
+                encode_field(reg, w, f, v, depth)?;
+            },
+            Option.None => {},
+        }
+    }
+    Result.Ok(wire.finish(w))
+}
+
+/// Encodes JSON text as a message by name.
+pub fn from_json(reg: schema.Registry, type_name: string, text: string) -> Result<bytes, string> {
+    let m = schema.message(reg, type_name)?;
+    let trimmed = text.trim();
+    if (trimmed == "") {
+        return Result.Ok(bytes_of([]));
+    }
+    let d = match (json.parse_doc(trimmed)) {
+        Result.Ok(x) => x,
+        Result.Err(e) => return Result.Err("invalid JSON: ${e}"),
+    };
+    encode_message(reg, m, d, 0)
+}
+
+// ---- schema-less view (protoc --decode_raw) ----
+
+fn c_escape(b: bytes) -> string {
+    var out = "";
+    for x in b {
+        out = out + match (x) {
+            10 => "\\n",
+            13 => "\\r",
+            9 => "\\t",
+            34 => "\\\"",
+            39 => "\\'",
+            92 => "\\\\",
+            _ => if (x >= 32 && x < 127) {
+                to_string(char_from_code(x).unwrap())
+            } else {
+                let o = "${(x >> 6) & 7}${(x >> 3) & 7}${x & 7}";
+                "\\${o}"
+            },
+        };
+    }
+    out
+}
+
+fn fixed_hex(n: int, digits: int) -> string {
+    let hexd = "0123456789abcdef";
+    var out = "";
+    for i in 0..digits {
+        let shift = 4 * (digits - 1 - i);
+        out = out + to_string(hexd[(n >> shift) & 15]);
+    }
+    "0x${out}"
+}
+
+/// The text `protoc --decode_raw` prints for a message (same heuristics: a length-delimited
+/// value that parses as a message is printed as one, else as an escaped string).
+pub fn decode_raw_text(data: bytes) -> Result<string, string> {
+    let fields = wire.parse_raw(data)?;
+    Result.Ok(raw_lines(fields, ""))
+}
+
+fn raw_lines(fields: [wire.RawField], indent: string) -> string {
+    var out = "";
+    for f in fields {
+        out = out + match (f.value) {
+            wire.Raw.Varint(n) => "${indent}${f.field}: ${unsigned_text(n)}\n",
+            wire.Raw.Fixed64(n) => "${indent}${f.field}: ${fixed_hex(n, 16)}\n",
+            wire.Raw.Fixed32(n) => "${indent}${f.field}: ${fixed_hex(n, 8)}\n",
+            wire.Raw.Group(g) => "${indent}${f.field} {\n${raw_lines(g, indent + "  ")}${indent}}\n",
+            wire.Raw.Bytes(b) => {
+                match (if (b.len() > 0) { wire.parse_raw(b) } else { Result.Err("empty") }) {
+                    Result.Ok(sub) => "${indent}${f.field} {\n${raw_lines(sub, indent + "  ")}${indent}}\n",
+                    Result.Err(_) => "${indent}${f.field}: \"${c_escape(b)}\"\n",
+                }
+            },
+        };
+    }
+    out
+}

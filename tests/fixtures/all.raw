@@ -1,0 +1,811 @@
+1 {
+  1: "common.proto"
+  2: "raygrpc.common"
+  4 {
+    1: "Point"
+    2 {
+      1: "x"
+      3: 1
+      4: 1
+      5: 17
+      10: "x"
+    }
+    2 {
+      1: "y"
+      3: 2
+      4: 1
+      5: 17
+      10: "y"
+    }
+  }
+  5 {
+    1: "Level"
+    2 {
+      1: "LEVEL_UNSPECIFIED"
+      2: 0
+    }
+    2 {
+      1: "LOW"
+      2: 1
+    }
+    2 {
+      1: "HIGH"
+      2: 2
+    }
+  }
+  12: "proto3"
+}
+1 {
+  1: "demo.proto"
+  2: "raygrpc.demo"
+  3: "common.proto"
+  4 {
+    1: "HelloRequest"
+    2 {
+      1: "name"
+      3: 1
+      4: 1
+      5: 9
+      10: "name"
+    }
+  }
+  4 {
+    1: "HelloReply"
+    2 {
+      1: "message"
+      3: 1
+      4: 1
+      5: 9
+      10: "message"
+    }
+  }
+  4 {
+    1: "Everything"
+    2 {
+      1: "f_double"
+      3: 1
+      4: 1
+      5: 1
+      10: "fDouble"
+    }
+    2 {
+      1: "f_float"
+      3: 2
+      4: 1
+      5: 2
+      10: "fFloat"
+    }
+    2 {
+      1: "f_int32"
+      3: 3
+      4: 1
+      5: 5
+      10: "fInt32"
+    }
+    2 {
+      1: "f_int64"
+      3: 4
+      4: 1
+      5: 3
+      10: "fInt64"
+    }
+    2 {
+      1: "f_uint32"
+      3: 5
+      4: 1
+      5: 13
+      10: "fUint32"
+    }
+    2 {
+      1: "f_uint64"
+      3: 6
+      4: 1
+      5: 4
+      10: "fUint64"
+    }
+    2 {
+      1: "f_sint32"
+      3: 7
+      4: 1
+      5: 17
+      10: "fSint32"
+    }
+    2 {
+      1: "f_sint64"
+      3: 8
+      4: 1
+      5: 18
+      10: "fSint64"
+    }
+    2 {
+      1: "f_fixed32"
+      3: 9
+      4: 1
+      5: 7
+      10: "fFixed32"
+    }
+    2 {
+      1: "f_fixed64"
+      3: 10
+      4: 1
+      5: 6
+      10: "fFixed64"
+    }
+    2 {
+      1: "f_sfixed32"
+      3: 11
+      4: 1
+      5: 15
+      10: "fSfixed32"
+    }
+    2 {
+      1: "f_sfixed64"
+      3: 12
+      4: 1
+      5: 16
+      10: "fSfixed64"
+    }
+    2 {
+      1: "f_bool"
+      3: 13
+      4: 1
+      5: 8
+      10: "fBool"
+    }
+    2 {
+      1: "f_string"
+      3: 14
+      4: 1
+      5: 9
+      10: "fString"
+    }
+    2 {
+      1: "f_bytes"
+      3: 15
+      4: 1
+      5: 12
+      10: "fBytes"
+    }
+    2 {
+      1: "level"
+      3: 16
+      4: 1
+      5: 14
+      6: ".raygrpc.common.Level"
+      10: "level"
+    }
+    2 {
+      1: "point"
+      3: 17
+      4: 1
+      5: 11
+      6: ".raygrpc.common.Point"
+      10: "point"
+    }
+    2 {
+      1: "packed_ints"
+      3: 18
+      4: 3
+      5: 5
+      10: "packedInts"
+    }
+    2 {
+      1: "packed_sints"
+      3: 19
+      4: 3
+      5: 18
+      10: "packedSints"
+    }
+    2 {
+      1: "packed_doubles"
+      3: 20
+      4: 3
+      5: 1
+      10: "packedDoubles"
+    }
+    2 {
+      1: "unpacked_fixed"
+      3: 21
+      4: 3
+      5: 7
+      8 {
+        2: 0
+      }
+      10: "unpackedFixed"
+    }
+    2 {
+      1: "names"
+      3: 22
+      4: 3
+      5: 9
+      10: "names"
+    }
+    2 {
+      1: "path"
+      3: 23
+      4: 3
+      5: 11
+      6: ".raygrpc.common.Point"
+      10: "path"
+    }
+    2 {
+      1: "counters"
+      3: 24
+      4: 3
+      5: 11
+      6: ".raygrpc.demo.Everything.CountersEntry"
+      10: "counters"
+    }
+    2 {
+      1: "points_by_id"
+      3: 25
+      4: 3
+      5: 11
+      6: ".raygrpc.demo.Everything.PointsByIdEntry"
+      10: "pointsById"
+    }
+    2 {
+      1: "text"
+      3: 26
+      4: 1
+      5: 9
+      9: 0
+      10: "text"
+    }
+    2 {
+      1: "at"
+      3: 27
+      4: 1
+      5: 11
+      6: ".raygrpc.common.Point"
+      9: 0
+      10: "at"
+    }
+    2 {
+      1: "nested_choice"
+      3: 28
+      4: 1
+      5: 11
+      6: ".raygrpc.demo.Everything.Nested"
+      9: 0
+      10: "nestedChoice"
+    }
+    2 {
+      1 {
+        13: 0x65627961
+      }
+      3: 29
+      4: 1
+      5: 5
+      9: 1
+      10 {
+        13: 0x65627961
+      }
+      17: 1
+    }
+    2 {
+      1: "nested"
+      3: 30
+      4: 1
+      5: 11
+      6: ".raygrpc.demo.Everything.Nested"
+      10: "nested"
+    }
+    3 {
+      1: "CountersEntry"
+      2 {
+        1: "key"
+        3: 1
+        4: 1
+        5: 9
+        10: "key"
+      }
+      2 {
+        1: "value"
+        3: 2
+        4: 1
+        5: 3
+        10: "value"
+      }
+      7 {
+        7: 1
+      }
+    }
+    3 {
+      1: "PointsByIdEntry"
+      2 {
+        1: "key"
+        3: 1
+        4: 1
+        5: 5
+        10: "key"
+      }
+      2 {
+        1: "value"
+        3: 2
+        4: 1
+        5: 11
+        6: ".raygrpc.common.Point"
+        10: "value"
+      }
+      7 {
+        7: 1
+      }
+    }
+    3 {
+      1: "Nested"
+      2 {
+        1: "label"
+        3: 1
+        4: 1
+        5: 9
+        10: "label"
+      }
+      2 {
+        1: "inner"
+        3: 2
+        4: 1
+        5: 11
+        6: ".raygrpc.demo.Everything.Nested.Inner"
+        10: "inner"
+      }
+      2 {
+        1: "mode"
+        3: 3
+        4: 1
+        5: 14
+        6: ".raygrpc.demo.Everything.Nested.Mode"
+        10: "mode"
+      }
+      3 {
+        1: "Inner"
+        2 {
+          1: "flags"
+          3: 1
+          4: 3
+          5: 8
+          10: "flags"
+        }
+      }
+      4 {
+        1: "Mode"
+        2 {
+          1: "MODE_UNSPECIFIED"
+          2: 0
+        }
+        2 {
+          1: "FAST"
+          2: 1
+        }
+        2 {
+          1: "SAFE"
+          2: 2
+        }
+      }
+    }
+    8 {
+      1: "choice"
+    }
+    8 {
+      1: "_maybe"
+    }
+  }
+  4 {
+    1: "EchoRequest"
+    2 {
+      1: "message"
+      3: 1
+      4: 1
+      5: 9
+      10: "message"
+    }
+    2 {
+      1: "code"
+      3: 2
+      4: 1
+      5: 5
+      10: "code"
+    }
+    2 {
+      1: "delay_ms"
+      3: 3
+      4: 1
+      5: 5
+      10: "delayMs"
+    }
+    2 {
+      1: "payload"
+      3: 4
+      4: 1
+      5: 11
+      6: ".raygrpc.demo.Everything"
+      10: "payload"
+    }
+  }
+  4 {
+    1: "EchoReply"
+    2 {
+      1: "message"
+      3: 1
+      4: 1
+      5: 9
+      10: "message"
+    }
+    2 {
+      1: "metadata"
+      3: 2
+      4: 3
+      5: 11
+      6: ".raygrpc.demo.EchoReply.MetadataEntry"
+      10: "metadata"
+    }
+    2 {
+      1: "payload"
+      3: 3
+      4: 1
+      5: 11
+      6: ".raygrpc.demo.Everything"
+      10: "payload"
+    }
+    2 {
+      1: "deadline_ms"
+      3: 4
+      4: 1
+      5: 3
+      10: "deadlineMs"
+    }
+    3 {
+      1: "MetadataEntry"
+      2 {
+        1: "key"
+        3: 1
+        4: 1
+        5: 9
+        10: "key"
+      }
+      2 {
+        1: "value"
+        3: 2
+        4: 1
+        5: 9
+        10: "value"
+      }
+      7 {
+        7: 1
+      }
+    }
+  }
+  4 {
+    1: "PutRequest"
+    2 {
+      1: "key"
+      3: 1
+      4: 1
+      5: 9
+      10: "key"
+    }
+    2 {
+      1: "value"
+      3: 2
+      4: 1
+      5: 12
+      10: "value"
+    }
+  }
+  4 {
+    1: "PutReply"
+    2 {
+      1: "created"
+      3: 1
+      4: 1
+      5: 8
+      10: "created"
+    }
+  }
+  4 {
+    1: "KeyRequest"
+    2 {
+      1: "key"
+      3: 1
+      4: 1
+      5: 9
+      10: "key"
+    }
+  }
+  4 {
+    1: "GetReply"
+    2 {
+      1: "value"
+      3: 1
+      4: 1
+      5: 12
+      10: "value"
+    }
+  }
+  4 {
+    1: "ListRequest"
+    2 {
+      1: "prefix"
+      3: 1
+      4: 1
+      5: 9
+      10: "prefix"
+    }
+  }
+  4 {
+    1: "ListReply"
+    2 {
+      1: "keys"
+      3: 1
+      4: 3
+      5: 9
+      10: "keys"
+    }
+  }
+  6 {
+    1: "Greeter"
+    2 {
+      1: "SayHello"
+      2: ".raygrpc.demo.HelloRequest"
+      3: ".raygrpc.demo.HelloReply"
+    }
+  }
+  6 {
+    1: "Echo"
+    2 {
+      1: "Echo"
+      2: ".raygrpc.demo.EchoRequest"
+      3: ".raygrpc.demo.EchoReply"
+    }
+    2 {
+      1: "Roundtrip"
+      2: ".raygrpc.demo.Everything"
+      3: ".raygrpc.demo.Everything"
+    }
+  }
+  6 {
+    1: "KeyValue"
+    2 {
+      1: "Put"
+      2: ".raygrpc.demo.PutRequest"
+      3: ".raygrpc.demo.PutReply"
+    }
+    2 {
+      1: "Get"
+      2: ".raygrpc.demo.KeyRequest"
+      3: ".raygrpc.demo.GetReply"
+    }
+    2 {
+      1: "Delete"
+      2: ".raygrpc.demo.KeyRequest"
+      3: ".raygrpc.demo.PutReply"
+    }
+    2 {
+      1: "List"
+      2: ".raygrpc.demo.ListRequest"
+      3: ".raygrpc.demo.ListReply"
+    }
+  }
+  12: "proto3"
+}
+1 {
+  1: "grpc/reflection/v1/reflection.proto"
+  2: "grpc.reflection.v1"
+  4 {
+    1: "ServerReflectionRequest"
+    2 {
+      1 {
+        13: 111
+        14 {
+        }
+      }
+      3: 1
+      4: 1
+      5: 9
+      10 {
+        13: 111
+        14 {
+        }
+      }
+    }
+    2 {
+      1: "file_by_filename"
+      3: 3
+      4: 1
+      5: 9
+      9: 0
+      10: "fileByFilename"
+    }
+    2 {
+      1: "file_containing_symbol"
+      3: 4
+      4: 1
+      5: 9
+      9: 0
+      10: "fileContainingSymbol"
+    }
+    2 {
+      1: "file_containing_extension"
+      3: 5
+      4: 1
+      5: 11
+      6: ".grpc.reflection.v1.ExtensionRequest"
+      9: 0
+      10: "fileContainingExtension"
+    }
+    2 {
+      1: "all_extension_numbers_of_type"
+      3: 6
+      4: 1
+      5: 9
+      9: 0
+      10: "allExtensionNumbersOfType"
+    }
+    2 {
+      1: "list_services"
+      3: 7
+      4: 1
+      5: 9
+      9: 0
+      10: "listServices"
+    }
+    8 {
+      1: "message_request"
+    }
+  }
+  4 {
+    1 {
+      8: 0x6e657478
+      14 {
+        13: 0x7365757165526e6f
+      }
+    }
+    2 {
+      1: "containing_type"
+      3: 1
+      4: 1
+      5: 9
+      10: "containingType"
+    }
+    2 {
+      1: "extension_number"
+      3: 2
+      4: 1
+      5: 5
+      10: "extensionNumber"
+    }
+  }
+  4 {
+    1: "ServerReflectionResponse"
+    2 {
+      1: "valid_host"
+      3: 1
+      4: 1
+      5: 9
+      10: "validHost"
+    }
+    2 {
+      1: "original_request"
+      3: 2
+      4: 1
+      5: 11
+      6: ".grpc.reflection.v1.ServerReflectionRequest"
+      10: "originalRequest"
+    }
+    2 {
+      1: "file_descriptor_response"
+      3: 4
+      4: 1
+      5: 11
+      6: ".grpc.reflection.v1.FileDescriptorResponse"
+      9: 0
+      10: "fileDescriptorResponse"
+    }
+    2 {
+      1: "all_extension_numbers_response"
+      3: 5
+      4: 1
+      5: 11
+      6: ".grpc.reflection.v1.ExtensionNumberResponse"
+      9: 0
+      10: "allExtensionNumbersResponse"
+    }
+    2 {
+      1: "list_services_response"
+      3: 6
+      4: 1
+      5: 11
+      6: ".grpc.reflection.v1.ListServiceResponse"
+      9: 0
+      10: "listServicesResponse"
+    }
+    2 {
+      1: "error_response"
+      3: 7
+      4: 1
+      5: 11
+      6: ".grpc.reflection.v1.ErrorResponse"
+      9: 0
+      10: "errorResponse"
+    }
+    8 {
+      1: "message_response"
+    }
+  }
+  4 {
+    1: "FileDescriptorResponse"
+    2 {
+      1: "file_descriptor_proto"
+      3: 1
+      4: 3
+      5: 12
+      10: "fileDescriptorProto"
+    }
+  }
+  4 {
+    1: "ExtensionNumberResponse"
+    2 {
+      1: "base_type_name"
+      3: 1
+      4: 1
+      5: 9
+      10: "baseTypeName"
+    }
+    2 {
+      1: "extension_number"
+      3: 2
+      4: 3
+      5: 5
+      10: "extensionNumber"
+    }
+  }
+  4 {
+    1: "ListServiceResponse"
+    2 {
+      1: "service"
+      3: 1
+      4: 3
+      5: 11
+      6: ".grpc.reflection.v1.ServiceResponse"
+      10: "service"
+    }
+  }
+  4 {
+    1: "ServiceResponse"
+    2 {
+      1: "name"
+      3: 1
+      4: 1
+      5: 9
+      10: "name"
+    }
+  }
+  4 {
+    1: "ErrorResponse"
+    2 {
+      1: "error_code"
+      3: 1
+      4: 1
+      5: 5
+      10: "errorCode"
+    }
+    2 {
+      1: "error_message"
+      3: 2
+      4: 1
+      5: 9
+      10: "errorMessage"
+    }
+  }
+  6 {
+    1: "ServerReflection"
+    2 {
+      1: "ServerReflectionInfo"
+      2: ".grpc.reflection.v1.ServerReflectionRequest"
+      3: ".grpc.reflection.v1.ServerReflectionResponse"
+      5: 1
+      6: 1
+    }
+  }
+  12: "proto3"
+}

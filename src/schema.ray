@@ -1,0 +1,352 @@
+//! The schema model: files, messages, fields, enums and services, the same shape as
+//! google/protobuf/descriptor.proto (so the .proto parser, the reflection client and the
+//! descriptor codec all meet here), plus a `Registry` that resolves fully-qualified names.
+
+/// Field types, numbered as `FieldDescriptorProto.Type`.
+pub const T_DOUBLE: int = 1;
+pub const T_FLOAT: int = 2;
+pub const T_INT64: int = 3;
+pub const T_UINT64: int = 4;
+pub const T_INT32: int = 5;
+pub const T_FIXED64: int = 6;
+pub const T_FIXED32: int = 7;
+pub const T_BOOL: int = 8;
+pub const T_STRING: int = 9;
+pub const T_GROUP: int = 10;
+pub const T_MESSAGE: int = 11;
+pub const T_BYTES: int = 12;
+pub const T_UINT32: int = 13;
+pub const T_ENUM: int = 14;
+pub const T_SFIXED32: int = 15;
+pub const T_SFIXED64: int = 16;
+pub const T_SINT32: int = 17;
+pub const T_SINT64: int = 18;
+
+/// Labels, numbered as `FieldDescriptorProto.Label`.
+pub const L_OPTIONAL: int = 1;
+pub const L_REQUIRED: int = 2;
+pub const L_REPEATED: int = 3;
+
+pub struct FieldDef {
+    name: string,
+    number: int,
+    label: int,
+    kind: int,
+    /// Fully-qualified with a leading dot (".pkg.Msg") for messages and enums, else "".
+    type_name: string,
+    /// Index into the message's oneofs, or -1.
+    oneof_index: int,
+    json_name: string,
+    /// proto3 `optional` (explicit presence through a synthetic oneof).
+    proto3_optional: bool,
+    /// `[packed = false]` written in the source; proto3 packs by default.
+    packed_off: bool,
+}
+
+pub struct EnumValueDef {
+    name: string,
+    number: int,
+}
+
+pub struct EnumDef {
+    name: string,
+    full_name: string,
+    values: [EnumValueDef],
+    allow_alias: bool,
+}
+
+pub struct MessageDef {
+    name: string,
+    full_name: string,
+    fields: [FieldDef],
+    nested: [MessageDef],
+    enums: [EnumDef],
+    oneofs: [string],
+    map_entry: bool,
+}
+
+pub struct MethodDef {
+    name: string,
+    input_type: string,
+    output_type: string,
+    client_streaming: bool,
+    server_streaming: bool,
+}
+
+pub struct ServiceDef {
+    name: string,
+    full_name: string,
+    methods: [MethodDef],
+}
+
+pub struct FileDef {
+    name: string,
+    package: string,
+    dependencies: [string],
+    messages: [MessageDef],
+    enums: [EnumDef],
+    services: [ServiceDef],
+    syntax: string,
+}
+
+pub fn new_message(name: string, full_name: string) -> MessageDef {
+    MessageDef { name: name, full_name: full_name, fields: [], nested: [], enums: [], oneofs: [], map_entry: false }
+}
+
+pub fn new_file(name: string) -> FileDef {
+    FileDef { name: name, package: "", dependencies: [], messages: [], enums: [], services: [], syntax: "proto3" }
+}
+
+/// protoc's default JSON name: drop underscores, upper-case the letter after each one.
+pub fn json_name_of(name: string) -> string {
+    var out = "";
+    var upper = false;
+    for c in name.chars() {
+        if (c == '_') {
+            upper = true;
+        } else if (upper) {
+            out = out + to_string(c).to_upper();
+            upper = false;
+        } else {
+            out = out + to_string(c);
+        }
+    }
+    out
+}
+
+pub fn is_repeated(f: FieldDef) -> bool {
+    f.label == L_REPEATED
+}
+
+/// Scalar numeric types that proto3 packs when repeated.
+pub fn is_packable(kind: int) -> bool {
+    kind != T_STRING && kind != T_BYTES && kind != T_MESSAGE && kind != T_GROUP
+}
+
+pub fn type_label(kind: int) -> string {
+    match (kind) {
+        1 => "double",
+        2 => "float",
+        3 => "int64",
+        4 => "uint64",
+        5 => "int32",
+        6 => "fixed64",
+        7 => "fixed32",
+        8 => "bool",
+        9 => "string",
+        10 => "group",
+        11 => "message",
+        12 => "bytes",
+        13 => "uint32",
+        14 => "enum",
+        15 => "sfixed32",
+        16 => "sfixed64",
+        17 => "sint32",
+        18 => "sint64",
+        _ => "type${kind}",
+    }
+}
+
+/// The scalar type of a keyword, or 0 when it names a message/enum.
+pub fn scalar_kind(word: string) -> int {
+    match (word) {
+        "double" => T_DOUBLE,
+        "float" => T_FLOAT,
+        "int64" => T_INT64,
+        "uint64" => T_UINT64,
+        "int32" => T_INT32,
+        "fixed64" => T_FIXED64,
+        "fixed32" => T_FIXED32,
+        "bool" => T_BOOL,
+        "string" => T_STRING,
+        "bytes" => T_BYTES,
+        "uint32" => T_UINT32,
+        "sfixed32" => T_SFIXED32,
+        "sfixed64" => T_SFIXED64,
+        "sint32" => T_SINT32,
+        "sint64" => T_SINT64,
+        _ => 0,
+    }
+}
+
+/// Every message, enum and service of a set of files, by fully-qualified name (no leading
+/// dot), plus which file declares each symbol.
+pub struct Registry {
+    files: Map<string, FileDef>,
+    file_order: [string],
+    messages: Map<string, MessageDef>,
+    enums: Map<string, EnumDef>,
+    services: Map<string, ServiceDef>,
+    symbol_file: Map<string, string>,
+}
+
+pub fn registry() -> Registry {
+    let files: Map<string, FileDef> = Map.new();
+    let messages: Map<string, MessageDef> = Map.new();
+    let enums: Map<string, EnumDef> = Map.new();
+    let services: Map<string, ServiceDef> = Map.new();
+    let symbol_file: Map<string, string> = Map.new();
+    Registry {
+        files: files,
+        file_order: [],
+        messages: messages,
+        enums: enums,
+        services: services,
+        symbol_file: symbol_file,
+    }
+}
+
+fn add_message(reg: Registry, file: string, m: MessageDef) {
+    reg.messages.insert(m.full_name, m);
+    reg.symbol_file.insert(m.full_name, file);
+    for n in m.nested {
+        add_message(reg, file, n);
+    }
+    for e in m.enums {
+        reg.enums.insert(e.full_name, e);
+        reg.symbol_file.insert(e.full_name, file);
+    }
+    for f in m.fields {
+        reg.symbol_file.insert("${m.full_name}.${f.name}", file);
+    }
+}
+
+/// Adds a file (idempotent by name).
+pub fn add_file(reg: Registry, f: FileDef) {
+    if (reg.files.contains_key(f.name)) {
+        return;
+    }
+    reg.files.insert(f.name, f);
+    reg.file_order.push(f.name);
+    for m in f.messages {
+        add_message(reg, f.name, m);
+    }
+    for e in f.enums {
+        reg.enums.insert(e.full_name, e);
+        reg.symbol_file.insert(e.full_name, f.name);
+    }
+    for s in f.services {
+        reg.services.insert(s.full_name, s);
+        reg.symbol_file.insert(s.full_name, f.name);
+        for m in s.methods {
+            reg.symbol_file.insert("${s.full_name}.${m.name}", f.name);
+        }
+    }
+}
+
+/// Strips one leading dot.
+pub fn bare(name: string) -> string {
+    name.strip_prefix(".").unwrap_or(name)
+}
+
+pub fn message(reg: Registry, name: string) -> Result<MessageDef, string> {
+    match (reg.messages.get(bare(name))) {
+        Option.Some(m) => Result.Ok(m),
+        Option.None => Result.Err("unknown message type ${bare(name)}"),
+    }
+}
+
+pub fn enum_def(reg: Registry, name: string) -> Result<EnumDef, string> {
+    match (reg.enums.get(bare(name))) {
+        Option.Some(e) => Result.Ok(e),
+        Option.None => Result.Err("unknown enum type ${bare(name)}"),
+    }
+}
+
+pub fn service(reg: Registry, name: string) -> Result<ServiceDef, string> {
+    match (reg.services.get(bare(name))) {
+        Option.Some(s) => Result.Ok(s),
+        Option.None => Result.Err("unknown service ${bare(name)}"),
+    }
+}
+
+/// Resolves "pkg.Service/Method" or "pkg.Service.Method".
+pub fn method(reg: Registry, full: string) -> Result<(ServiceDef, MethodDef), string> {
+    let name = bare(full.replace("/", "."));
+    match (name.last_index_of(".")) {
+        Option.Some(i) => {
+            let svc = service(reg, name.substring(0, i))?;
+            let m = name.substring(i + 1, name.len());
+            for x in svc.methods {
+                if (x.name == m) {
+                    return Result.Ok((svc, x));
+                }
+            }
+            Result.Err("service ${svc.full_name} has no method ${m}")
+        },
+        Option.None => Result.Err("not a method name: ${full}"),
+    }
+}
+
+pub fn service_names(reg: Registry) -> [string] {
+    sort(reg.services.keys())
+}
+
+pub fn field_by_number(m: MessageDef, number: int) -> Option<FieldDef> {
+    for f in m.fields {
+        if (f.number == number) {
+            return Option.Some(f);
+        }
+    }
+    Option.None
+}
+
+/// Finds a field by its JSON name or its proto name.
+pub fn field_by_json(m: MessageDef, key: string) -> Option<FieldDef> {
+    for f in m.fields {
+        if (f.json_name == key || f.name == key) {
+            return Option.Some(f);
+        }
+    }
+    Option.None
+}
+
+/// The fields sorted by number (the order protoc writes them).
+pub fn fields_by_number(m: MessageDef) -> [FieldDef] {
+    sort_by(m.fields, fn(a: FieldDef, b: FieldDef) -> bool { a.number < b.number })
+}
+
+pub fn enum_name(e: EnumDef, number: int) -> Option<string> {
+    for v in e.values {
+        if (v.number == number) {
+            return Option.Some(v.name);
+        }
+    }
+    Option.None
+}
+
+pub fn enum_number(e: EnumDef, name: string) -> Option<int> {
+    for v in e.values {
+        if (v.name == name) {
+            return Option.Some(v.number);
+        }
+    }
+    Option.None
+}
+
+/// The file that declares `symbol`, and every file it depends on (transitively), each once,
+/// dependencies first — what a reflection server answers.
+pub fn file_closure(reg: Registry, file: string) -> [string] {
+    var seen: [string] = [];
+    closure_into(reg, file, seen);
+    seen
+}
+
+fn closure_into(reg: Registry, file: string, seen: [string]) {
+    if (seen.contains(file)) {
+        return;
+    }
+    match (reg.files.get(file)) {
+        Option.Some(f) => {
+            for d in f.dependencies {
+                closure_into(reg, d, seen);
+            }
+            seen.push(file);
+        },
+        Option.None => {},
+    }
+}
+
+pub fn file_of_symbol(reg: Registry, symbol: string) -> Option<string> {
+    reg.symbol_file.get(bare(symbol))
+}
